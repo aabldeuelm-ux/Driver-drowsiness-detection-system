@@ -1,0 +1,6 @@
+{
+  "name": "Driver Drowsiness Detection System",
+  "description": "Experimental admin dashboard for monitoring prolonged eye closure through a local or ESP32-CAM camera feed.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

@@ -1,0 +1,22 @@
+# Dependencies and generated output
+node_modules/
+dist/
+build/
+coverage/
+.vercel/
+*.tsbuildinfo
+
+# Local secrets and environment overrides
+secrets.h
+.env
+.env.*
+!.env.example
+!*.example.h
+
+# Backups, archives, and local editor/OS files
+*.tar.gz
+*.tgz
+*.zip
+*.bak
+.DS_Store
+*.log
