@@ -1,5 +1,6 @@
 import {useEffect, useState} from 'react';
 import {
+  Activity,
   CircleSlash,
   Crosshair,
   Download,
@@ -25,6 +26,7 @@ import {
   validateProlongedClosureMs,
 } from '../vision/eyeClosureMonitor';
 import {useTracking} from '../vision/TrackingContext';
+import {DEFAULT_YAWN_MIN_DURATION_MS} from '../vision/yawnMonitor';
 import {StatusBadge} from './StatusBadge';
 
 export function SettingsCalibrationScreen() {
@@ -212,10 +214,18 @@ export function SettingsCalibrationScreen() {
               </div>
 
               <StatusBadge
-                icon={<CircleSlash className="h-3.5 w-3.5" />}
-                label="Not enabled"
+                icon={<Activity className="h-3.5 w-3.5" />}
+                label={tracking.state.yawn.label}
+                tone={tracking.state.yawn.tone}
               />
             </div>
+
+            <p className="mt-2 text-xs leading-relaxed text-slate-400">
+              Experimental, browser-only alerting from a sustained mouth opening
+              above the calibrated relaxed-mouth baseline. Thresholds are derived
+              per session and are not persisted. This is not drowsiness
+              classification or a confirmed yawn.
+            </p>
 
             <div className="mt-4 grid grid-cols-1 gap-4 sm:grid-cols-2">
               <div className="space-y-1.5">
@@ -223,15 +233,19 @@ export function SettingsCalibrationScreen() {
                   htmlFor="yawn-ratio-input"
                   className="block text-xs font-medium text-slate-300"
                 >
-                  Mouth-opening threshold
+                  Derived high threshold
                 </label>
                 <input
                   id="yawn-ratio-input"
                   type="text"
-                  disabled
-                  value=""
-                  placeholder="Not configured"
-                  className="min-h-[44px] w-full rounded-lg border border-slate-800 bg-[#0B1221] px-3.5 py-2 font-mono text-sm text-slate-400 placeholder:text-slate-500 disabled:cursor-not-allowed disabled:opacity-75"
+                  readOnly
+                  value={
+                    tracking.state.yawn.openThreshold === null
+                      ? ''
+                      : tracking.state.yawn.openThreshold.toFixed(3)
+                  }
+                  placeholder="Complete calibration"
+                  className="min-h-[44px] w-full rounded-lg border border-slate-800 bg-[#0B1221] px-3.5 py-2 font-mono text-sm text-slate-300 placeholder:text-slate-500 read-only:cursor-default"
                 />
               </div>
 
@@ -240,15 +254,14 @@ export function SettingsCalibrationScreen() {
                   htmlFor="yawn-duration-input"
                   className="block text-xs font-medium text-slate-300"
                 >
-                  Minimum yawn duration (ms)
+                  Minimum sustained opening (ms)
                 </label>
                 <input
                   id="yawn-duration-input"
                   type="text"
-                  disabled
-                  value=""
-                  placeholder="Not configured"
-                  className="min-h-[44px] w-full rounded-lg border border-slate-800 bg-[#0B1221] px-3.5 py-2 font-mono text-sm text-slate-400 placeholder:text-slate-500 disabled:cursor-not-allowed disabled:opacity-75"
+                  readOnly
+                  value={String(DEFAULT_YAWN_MIN_DURATION_MS)}
+                  className="min-h-[44px] w-full rounded-lg border border-slate-800 bg-[#0B1221] px-3.5 py-2 font-mono text-sm text-slate-300 read-only:cursor-default"
                 />
               </div>
             </div>
@@ -359,7 +372,7 @@ export function SettingsCalibrationScreen() {
                 id="calibration-heading"
                 className="text-base font-semibold tracking-tight text-slate-100 sm:text-lg"
               >
-                Eye Calibration
+                Calibration
               </h2>
 
               <StatusBadge
@@ -383,8 +396,8 @@ export function SettingsCalibrationScreen() {
                   02.
                 </span>
                 <span>
-                  Sit naturally with eyes open for a few seconds, then briefly
-                  close both eyes when prompted.
+                  Click Calibrate once, look at the camera, relax your mouth,
+                  and blink normally during the short session.
                 </span>
               </li>
               <li className="flex gap-2.5">

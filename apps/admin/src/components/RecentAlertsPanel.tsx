@@ -3,6 +3,7 @@ import {useAlerts} from '../alerts/AlertsContext';
 import {
   cameraSourceLabel,
   endReasonLabel,
+  eventTypeLabel,
   formatDuration,
   formatTimestamp,
 } from '../alerts/eventStore';
@@ -47,8 +48,9 @@ export function RecentAlertsPanel() {
               : 'No alerts recorded yet.'}
           </p>
           <p className="mt-1 max-w-xs text-xs leading-relaxed text-slate-400">
-            Prolonged eye-closure episodes are recorded here after monitoring runs.
-            Ordinary blinks and tracking interruptions do not create alerts.
+            Prolonged eye-closure and sustained possible-yawn alerts are recorded
+            here. Ordinary blinks, brief mouth openings, and tracking
+            interruptions do not create alerts.
           </p>
         </div>
       ) : (
@@ -61,7 +63,7 @@ export function RecentAlertsPanel() {
                     className="h-3.5 w-3.5 shrink-0 text-amber-400"
                     aria-hidden="true"
                   />
-                  Prolonged eye closure
+                  {eventTypeLabel(event.type)}
                 </span>
                 <span className="font-mono text-[11px] text-slate-400">
                   {formatTimestamp(event.timestamp)}

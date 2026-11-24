@@ -1,8 +1,7 @@
 import {describe, expect, it} from 'vitest';
 import {
-  CALIBRATION_CLOSED_DURATION_MS,
-  CALIBRATION_OPEN_DURATION_MS,
-  CALIBRATION_PREPARE_DURATION_MS,
+  CALIBRATION_DURATION_MS,
+  CALIBRATION_UNSTABLE_MESSAGE,
   CalibrationEngine,
   calibrationLabel,
   type CalibrationSample,
@@ -10,256 +9,156 @@ import {
 
 const RESOLUTION = {width: 640, height: 480};
 
-function samplesBetween(
-  fromExclusive: number,
-  toInclusive: number,
-  step: number,
-  leftEAROrValues: number | readonly number[],
-  rightEAROrValues: number | readonly number[] = leftEAROrValues,
-): CalibrationSample[] {
-  const samples: CalibrationSample[] = [];
-  let index = 0;
-  for (let atMs = fromExclusive + step; atMs <= toInclusive; atMs += step) {
-    const left = Array.isArray(leftEAROrValues)
-      ? leftEAROrValues[index % leftEAROrValues.length]
-      : leftEAROrValues;
-    const right = Array.isArray(rightEAROrValues)
-      ? rightEAROrValues[index % rightEAROrValues.length]
-      : rightEAROrValues;
-    samples.push({leftEAR: left ?? 0, rightEAR: right ?? 0, atMs});
-    index += 1;
-  }
-  return samples;
+function sample(
+  atMs: number,
+  leftEAR = 0.2,
+  rightEAR = 0.24,
+  faceId: number | null = 1,
+): CalibrationSample {
+  return {atMs, leftEAR, rightEAR, faceId};
 }
 
-function feed(engine: CalibrationEngine, samples: readonly CalibrationSample[]): void {
-  for (const sample of samples) engine.observe(sample, RESOLUTION);
-}
-
-function completeOpenStage(
+function feed(
   engine: CalibrationEngine,
-  leftEAR: number | readonly number[] = 0.2,
-  rightEAR: number | readonly number[] = 0.24,
-): number {
-  const samples = samplesBetween(
-    0,
-    CALIBRATION_OPEN_DURATION_MS,
-    100,
-    leftEAR,
-    rightEAR,
-  );
-  feed(engine, samples);
-  return CALIBRATION_OPEN_DURATION_MS;
-}
-
-function completePreparation(
-  engine: CalibrationEngine,
-  openEnd: number,
-  earlyLeftEAR = 0.2,
-  earlyRightEAR = 0.24,
-): number {
-  const prepareEnd = openEnd + CALIBRATION_PREPARE_DURATION_MS;
-  feed(
-    engine,
-    samplesBetween(
-      openEnd,
-      prepareEnd,
-      100,
-      earlyLeftEAR,
-      earlyRightEAR,
-    ),
-  );
-  return prepareEnd;
-}
-
-function completeClosedStage(
-  engine: CalibrationEngine,
-  prepareEnd: number,
-  leftEAR: number | readonly number[] = 0.1,
-  rightEAR: number | readonly number[] = 0.12,
+  samples: readonly CalibrationSample[],
 ): void {
-  feed(
-    engine,
-    samplesBetween(
-      prepareEnd,
-      prepareEnd + CALIBRATION_CLOSED_DURATION_MS + 100,
-      100,
-      leftEAR,
-      rightEAR,
-    ),
+  for (const item of samples) engine.observe(item, RESOLUTION);
+}
+
+function steadySamples(
+  fromMs: number,
+  count: number,
+  leftEAR = 0.2,
+  rightEAR = 0.24,
+  faceId: number | null = 1,
+): CalibrationSample[] {
+  return Array.from({length: count}, (_, index) =>
+    sample(fromMs + index * 100, leftEAR, rightEAR, faceId),
   );
 }
 
 function calibratedEngine(): CalibrationEngine {
   const engine = new CalibrationEngine();
-  engine.begin(0, RESOLUTION);
-  const openEnd = completeOpenStage(engine);
-  const prepareEnd = completePreparation(engine, openEnd);
-  completeClosedStage(engine, prepareEnd);
+  engine.begin(0, RESOLUTION, 1);
+  feed(
+    engine,
+    steadySamples(100, Math.ceil(CALIBRATION_DURATION_MS / 100) + 4),
+  );
   return engine;
 }
 
 describe('CalibrationEngine', () => {
-  it('derives separate thresholds and capped reopen thresholds after guided stages', () => {
+  it('collects both baselines in one session and derives per-eye thresholds', () => {
     const engine = new CalibrationEngine();
-    engine.begin(0, RESOLUTION);
-    expect(engine.getState().step).toBe('open');
-    expect(engine.getState().instruction).toContain('eyes open');
+    engine.begin(0, RESOLUTION, 1);
+    expect(engine.getState().step).toBe('collecting');
+    expect(engine.getState().instruction).toBe(
+      'Look at the camera and relax your mouth. You can blink normally.',
+    );
 
-    const openEnd = completeOpenStage(engine);
-    expect(engine.getState().step).toBe('preparing');
-    expect(engine.getState().progress).toBeCloseTo(0.5, 5);
-    expect(engine.getState().openProgress).toBe(1);
-    expect(engine.getState().instruction).toContain('get ready');
-
-    const prepareEnd = completePreparation(engine, openEnd);
-    expect(engine.getState().step).toBe('closed');
-    expect(engine.getState().prepareProgress).toBe(1);
-    expect(engine.getState().instruction).toContain('close both eyes');
-
-    completeClosedStage(engine, prepareEnd);
+    feed(engine, steadySamples(100, 26));
 
     const state = engine.getState();
     expect(state.step).toBe('success');
+    expect(state.instruction).toBe('Calibration complete.');
     expect(state.progress).toBe(1);
     expect(calibrationLabel(state)).toBe('Calibrated');
+    expect(state.result?.faceId).toBe(1);
     expect(state.result?.left.threshold).toBeCloseTo(0.15, 5);
-    expect(state.result?.right.threshold).toBeCloseTo(0.18, 5);
-    expect(state.result?.left.separation).toBeCloseTo(0.1, 5);
-    expect(state.result?.right.separation).toBeCloseTo(0.12, 5);
-    expect(state.result?.left.openSummary.count).toBe(25);
-    expect(state.result?.left.closedSummary.count).toBe(7);
+    expect(state.result?.right.threshold).toBeCloseTo(0.19, 5);
     expect(state.result?.left.reopenThreshold).toBeCloseTo(0.16, 5);
     expect(state.result?.left.reopenThreshold).toBeLessThanOrEqual(
-      state.result!.left.openSummary.p10,
+      state.result!.left.openSummary.mean,
     );
+    expect(state.result?.left.openSummary.count).toBe(22);
     expect(state.result?.resolution).toEqual(RESOLUTION);
   });
 
-  it('rejects invalid EAR samples with an explanatory failure', () => {
+  it('skips normal blinks without resetting progress or valid samples', () => {
     const engine = new CalibrationEngine();
-    engine.begin(0, RESOLUTION);
-    engine.observe({leftEAR: Number.NaN, rightEAR: 0.24, atMs: 100}, RESOLUTION);
+    engine.begin(0, RESOLUTION, 1);
+    feed(engine, steadySamples(100, 8));
 
+    const before = engine.getState();
+    expect(before.openSampleCount).toBe(8);
+    engine.observe(sample(900, 0.06, 0.08), RESOLUTION);
+
+    const afterBlink = engine.getState();
+    expect(afterBlink.step).toBe('collecting');
+    expect(afterBlink.openSampleCount).toBe(8);
+    expect(afterBlink.skippedBlinkSamples).toBe(1);
+    expect(afterBlink.progress).toBeGreaterThanOrEqual(before.progress);
+
+    feed(engine, steadySamples(1000, 18));
+    expect(engine.getState().step).toBe('success');
+    expect(engine.getState().result?.left.openSummary.count).toBe(21);
+  });
+
+  it('keeps valid samples through a brief tracking interruption', () => {
+    const engine = new CalibrationEngine();
+    engine.begin(0, RESOLUTION, 1);
+    feed(engine, steadySamples(100, 8));
+    const before = engine.getState();
+
+    engine.observe(sample(1800, 0.2, 0.24), RESOLUTION);
+    expect(engine.getState().step).toBe('collecting');
+    expect(engine.getState().openSampleCount).toBe(before.openSampleCount);
+
+    feed(engine, steadySamples(1900, 8));
+    expect(engine.getState().step).toBe('success');
+  });
+
+  it('shows one actionable message when tracking stays unstable', () => {
+    const engine = new CalibrationEngine();
+    engine.begin(0, RESOLUTION, 1);
+    feed(engine, steadySamples(100, 8));
+
+    engine.onInterruption('tracking-gap', 1000);
+    expect(engine.getState().step).toBe('collecting');
+
+    engine.onInterruption('tracking-gap', 2600);
     expect(engine.getState().step).toBe('failed');
-    expect(engine.getState().failure?.reason).toBe('invalid-sample');
-    expect(engine.getState().failure?.message).toMatch(/invalid eye measurement/i);
-    expect(engine.getState().result).toBeNull();
-  });
-
-  it('rejects gaps in the valid sample stream', () => {
-    const engine = new CalibrationEngine();
-    engine.begin(0, RESOLUTION);
-    engine.observe({leftEAR: 0.2, rightEAR: 0.24, atMs: 100}, RESOLUTION);
-    engine.observe({leftEAR: 0.2, rightEAR: 0.24, atMs: 700}, RESOLUTION);
-
-    expect(engine.getState().failure?.reason).toBe('tracking-gap');
-    expect(engine.getState().failure?.message).toMatch(/interrupted/i);
-  });
-
-  it('rejects insufficient open-versus-closed separation per eye', () => {
-    const engine = new CalibrationEngine();
-    engine.begin(0, RESOLUTION);
-    // Open variation includes a low value; the derived threshold sits close to
-    // it, so the closed set cannot be separated from normal open variation.
-    const openEnd = completeOpenStage(engine, [0.2, 0.25], [0.2, 0.25]);
-    const prepareEnd = completePreparation(engine, openEnd);
-    completeClosedStage(engine, prepareEnd, 0.15, 0.15);
-
-    expect(engine.getState().step).toBe('failed');
-    expect(engine.getState().failure?.reason).toBe('insufficient-separation');
-    expect(engine.getState().failure?.message).toMatch(/overlapped|too close/i);
-    expect(engine.getState().result).toBeNull();
-  });
-
-  it('rejects overlapping sample ranges even when the means differ', () => {
-    const engine = new CalibrationEngine();
-    engine.begin(0, RESOLUTION);
-    const openEnd = completeOpenStage(engine, 0.4, 0.4);
-    const prepareEnd = completePreparation(engine, openEnd, 0.4, 0.4);
-    // One high "closed" sample is accepted by the entry filter but its range
-    // still straddles the midpoint threshold.
-    completeClosedStage(
-      engine,
-      prepareEnd,
-      [0.35, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1],
-      [0.35, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1],
+    expect(engine.getState().failure?.message).toBe(
+      CALIBRATION_UNSTABLE_MESSAGE,
     );
-
-    expect(engine.getState().step).toBe('failed');
-    expect(engine.getState().failure?.reason).toBe('insufficient-separation');
-    expect(engine.getState().result).toBeNull();
   });
 
-  it('ignores early closure and transition frames instead of shifting thresholds', () => {
+  it('rejects samples from a different spatial face without resetting progress', () => {
     const engine = new CalibrationEngine();
-    engine.begin(0, RESOLUTION);
-    const openEnd = completeOpenStage(engine);
-    // Closing during the preparation interval must not enter the closed set.
-    const prepareEnd = completePreparation(engine, openEnd, 0.1, 0.12);
-    expect(engine.getState().step).toBe('closed');
+    engine.begin(0, RESOLUTION, 1);
+    feed(engine, steadySamples(100, 8));
+    const before = engine.getState();
 
-    feed(
-      engine,
-      samplesBetween(
-        prepareEnd,
-        prepareEnd + 200,
-        100,
-        0.31,
-        0.265,
-      ),
-    );
-    feed(
-      engine,
-      samplesBetween(
-        prepareEnd + 200,
-        prepareEnd + CALIBRATION_CLOSED_DURATION_MS + 300,
-        100,
-        0.1,
-        0.12,
-      ),
-    );
+    feed(engine, steadySamples(900, 5, 0.05, 0.05, 2));
 
-    const state = engine.getState();
-    expect(state.step).toBe('success');
-    expect(state.rejectedClosedSamples).toBeGreaterThanOrEqual(2);
-    expect(state.result?.left.closedSummary.max).toBeCloseTo(0.1, 5);
-    expect(state.result?.right.closedSummary.max).toBeCloseTo(0.12, 5);
-    expect(state.result?.left.threshold).toBeCloseTo(0.15, 5);
-    expect(state.result?.right.threshold).toBeCloseTo(0.18, 5);
+    expect(engine.getState().openSampleCount).toBe(before.openSampleCount);
+    expect(engine.getState().rejectedFaceSamples).toBe(5);
+    expect(engine.getState().step).toBe('collecting');
   });
 
-  it('cancels without keeping partial measurements and can retry cleanly', () => {
-    const engine = new CalibrationEngine();
-    engine.begin(0, RESOLUTION);
-    engine.observe({leftEAR: 0.2, rightEAR: 0.24, atMs: 100}, RESOLUTION);
-    engine.cancel();
+  it('reuses a completed eye baseline when only the mouth baseline retries', () => {
+    const engine = calibratedEngine();
+    const result = engine.getState().result;
+    expect(result).not.toBeNull();
 
-    expect(engine.getState().step).toBe('cancelled');
-    expect(calibrationLabel(engine.getState())).toBe('Calibration cancelled');
-    expect(engine.getState().failure?.reason).toBe('cancelled');
-    expect(engine.getState().result).toBeNull();
+    engine.resume(5000, RESOLUTION, 1);
 
-    engine.observe({leftEAR: 0.2, rightEAR: 0.24, atMs: 200}, RESOLUTION);
-    expect(engine.getState().step).toBe('cancelled');
-
-    engine.retry(300, RESOLUTION);
-    expect(engine.getState().step).toBe('open');
-    expect(engine.getState().failure).toBeNull();
-    expect(engine.getState().progress).toBe(0);
+    expect(engine.getState().step).toBe('success');
+    expect(engine.getState().result).toBe(result);
+    expect(engine.getState().progress).toBe(1);
   });
 
-  it('invalidates a completed calibration when the camera or resolution changes', () => {
+  it('invalidates a completed calibration on face, camera, or resolution changes', () => {
     const engine = calibratedEngine();
     expect(engine.getState().result).not.toBeNull();
 
-    engine.invalidate('camera-changed');
+    engine.invalidate('face-selection-changed');
     expect(engine.getState().step).toBe('failed');
-    expect(engine.getState().failure?.reason).toBe('camera-changed');
+    expect(engine.getState().failure?.reason).toBe('face-selection-changed');
     expect(engine.getState().result).toBeNull();
 
-    engine.retry(1000, RESOLUTION);
-    engine.observe({leftEAR: 0.2, rightEAR: 0.24, atMs: 1100}, {width: 800, height: 600});
+    engine.begin(1000, RESOLUTION, 2);
+    engine.observe(sample(1100, 0.2, 0.24, 2), {width: 800, height: 600});
     expect(engine.getState().failure?.reason).toBe('resolution-changed');
   });
 });

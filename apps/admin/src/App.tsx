@@ -1,6 +1,7 @@
 import {useEffect, useState} from 'react';
 import {HardDrive} from 'lucide-react';
 import {AlertHistoryScreen} from './components/AlertHistoryScreen';
+import {AlertPopupStack} from './components/AlertPopupStack';
 import {CameraPreviewCard} from './components/CameraPreviewCard';
 import {DevicesHardwareScreen} from './components/DevicesHardwareScreen';
 import {LiveMonitoringScreen} from './components/LiveMonitoringScreen';
@@ -98,12 +99,14 @@ function AdminApp() {
               experimental closure measurement, browser sound alerts, and local
               event history work in this browser. The ESP32 is an optional,
               separately configured LED/buzzer alert device over USB serial or
-              Wi-Fi. Drowsiness classification and yawning detection remain
-              unimplemented.
+              Wi-Fi. Possible-yawn alerts are experimental; drowsiness
+              classification remains unimplemented.
             </span>
           </footer>
         </main>
       </div>
+
+      <AlertPopupStack />
 
       <SetupMonitoringModal
         open={setupModalOpen}

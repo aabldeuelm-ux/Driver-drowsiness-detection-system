@@ -1,45 +1,28 @@
 /**
- * Guided, in-memory eye calibration.
+ * Session-only, in-memory eye calibration.
  *
- * This module is intentionally pure: the caller supplies monotonic timestamps
- * and EAR values, so the whole flow can be tested without a camera.
+ * The user performs one short session: look at the camera, relax the mouth,
+ * and blink normally. Both the open-eye baseline and the relaxed-mouth baseline
+ * are sampled together by their respective engines; this engine only handles
+ * the eye half. Normal blinks, talking, and brief tracking gaps are skipped
+ * rather than treated as failures, while valid samples from the selected face
+ * stay in the window.
  *
- * Method and limitations
- * ----------------------
- * For each eye independently we collect a baseline while the user sits naturally
- * with eyes open, then a short deliberate bilateral closure. A short preparation
- * interval separates the instruction from sample collection, and closed-stage
- * samples that have not clearly dropped below the open baseline are rejected as
- * transition frames.
- *
- * The close threshold is the midpoint between the two measured means. The reopen
- * threshold adds hysteresis but is capped at the 10th percentile of the open
- * samples, so normal measured open variation can end a closure state. Both
- * thresholds are derived only from this session's samples; no reported EAR value
- * is hardcoded.
- *
- * Calibration fails if measurements are invalid, results are stale or interrupted,
- * the camera resolution changes mid-flow, too few stable samples are collected,
- * or the open/closed sample sets overlap. EAR is a geometric ratio from MediaPipe
- * landmarks. Thresholds depend on camera position, resolution, lighting, and
- * individual anatomy, and are valid only for the camera/resolution used during
- * calibration. This is an experimental measurement, not a clinical or
- * safety-grade assessment. Nothing here is persisted.
+ * The close threshold is estimated from this session's open-eye distribution
+ * using a conservative per-session margin. No absolute EAR value is hardcoded
+ * as a threshold. The reopen threshold adds hysteresis but stays below the
+ * measured open-eye mean, so ordinary open-eye variation can end a closure.
+ * Nothing here is persisted. This is an experimental geometric measurement,
+ * not a clinical or safety-grade assessment.
  */
 
-export type CalibrationStep =
-  | 'idle'
-  | 'open'
-  | 'preparing'
-  | 'closed'
-  | 'success'
-  | 'failed'
-  | 'cancelled';
+export type CalibrationStep = 'idle' | 'collecting' | 'success' | 'failed' | 'cancelled';
 
 export type CalibrationFailureReason =
   | 'tracking-not-active'
   | 'face-not-single'
   | 'stale-results'
+  | 'unstable-tracking'
   | 'invalid-sample'
   | 'tracking-gap'
   | 'page-hidden'
@@ -48,7 +31,8 @@ export type CalibrationFailureReason =
   | 'insufficient-separation'
   | 'cancelled'
   | 'tracking-stopped'
-  | 'camera-changed';
+  | 'camera-changed'
+  | 'face-selection-changed';
 
 export interface CalibrationResolution {
   width: number;
@@ -59,6 +43,8 @@ export interface CalibrationSample {
   leftEAR: number;
   rightEAR: number;
   atMs: number;
+  /** Spatial-only track ID from the face tracker, when available. */
+  faceId?: number | null;
 }
 
 export interface CalibrationSampleSummary {
@@ -66,18 +52,20 @@ export interface CalibrationSampleSummary {
   mean: number;
   min: number;
   max: number;
-  /** 10th percentile; used to keep the reopen threshold within open variation. */
+  /** 10th percentile; used to keep the estimated closure reference stable. */
   p10: number;
 }
 
 export interface CalibrationEyeResult {
   openMean: number;
+  /** Estimated closure reference derived from the open-eye distribution. */
   closedMean: number;
   openSummary: CalibrationSampleSummary;
+  /** Single-value summary for the derived closure reference. */
   closedSummary: CalibrationSampleSummary;
-  /** Midpoint of openMean and closedMean. */
+  /** Midpoint of openMean and the derived closure reference. */
   threshold: number;
-  /** threshold + hysteresis, capped at the low end of measured open values. */
+  /** threshold + hysteresis, capped below the measured open-eye mean. */
   reopenThreshold: number;
   /** openMean - closedMean. */
   separation: number;
@@ -88,6 +76,7 @@ export interface CalibrationResult {
   right: CalibrationEyeResult;
   capturedAtMs: number;
   resolution: CalibrationResolution;
+  faceId: number | null;
 }
 
 export interface CalibrationFailure {
@@ -98,75 +87,67 @@ export interface CalibrationFailure {
 export interface CalibrationState {
   step: CalibrationStep;
   instruction: string;
-  /** 0..1 across the whole guided flow. */
+  /** 0..1 across the single sampling session. */
   progress: number;
-  openProgress: number;
-  prepareProgress: number;
-  closedProgress: number;
   openSampleCount: number;
-  closedSampleCount: number;
-  /** Closed-stage samples rejected because they looked like transitions. */
-  rejectedClosedSamples: number;
+  /** Low-EAR frames skipped as normal blinks. */
+  skippedBlinkSamples: number;
+  /** Frames rejected because they belonged to a different spatial face ID. */
+  rejectedFaceSamples: number;
   failure: CalibrationFailure | null;
   result: CalibrationResult | null;
 }
 
-export const CALIBRATION_OPEN_DURATION_MS = 2500;
-export const CALIBRATION_PREPARE_DURATION_MS = 600;
-export const CALIBRATION_CLOSED_DURATION_MS = 700;
+export const CALIBRATION_DURATION_MS = 2200;
 export const CALIBRATION_MAX_SAMPLE_GAP_MS = 400;
+export const CALIBRATION_UNSTABLE_TIMEOUT_MS = 1500;
 export const CALIBRATION_MIN_EAR = 0.03;
 export const CALIBRATION_MAX_EAR = 0.6;
-export const CALIBRATION_MIN_OPEN_SAMPLES = 10;
-export const CALIBRATION_MIN_CLOSED_SAMPLES = 3;
+export const CALIBRATION_MIN_OPEN_SAMPLES = 12;
+export const CALIBRATION_MIN_SAMPLES_PER_EYE = 10;
 export const CALIBRATION_MIN_SEPARATION = 0.04;
-/** Hysteresis is relative to measured separation, not to a fixed EAR value. */
+/** Conservative drop from the relaxed open-eye baseline to closure. */
+export const CALIBRATION_CLOSURE_DROP_EAR = 0.1;
 export const CALIBRATION_HYSTERESIS_FRACTION = 0.1;
 export const CALIBRATION_MIN_HYSTERESIS_EAR = 0.008;
+export const CALIBRATION_INSTRUCTION =
+  'Look at the camera and relax your mouth. You can blink normally.';
+export const CALIBRATION_UNSTABLE_MESSAGE =
+  'Move into better light and center your face in the frame.';
 
 const FAILURE_MESSAGES: Record<CalibrationFailureReason, string> = {
   'tracking-not-active':
     'Calibration needs active tracking with a live camera. Start the camera and tracking first.',
   'face-not-single':
-    'Calibration needs exactly one visible face. Center your face and try again.',
-  'stale-results':
-    'Calibration needs fresh tracking results. Check the camera preview and try again.',
-  'invalid-sample':
-    'Calibration received an invalid eye measurement. Check lighting and camera position, then retry.',
-  'tracking-gap':
-    'Calibration was interrupted by a gap in valid results. Keep one face visible and retry.',
+    'More than one face is visible. Select one person in the preview, then click Calibrate.',
+  'stale-results': CALIBRATION_UNSTABLE_MESSAGE,
+  'unstable-tracking': CALIBRATION_UNSTABLE_MESSAGE,
+  'invalid-sample': CALIBRATION_UNSTABLE_MESSAGE,
+  'tracking-gap': CALIBRATION_UNSTABLE_MESSAGE,
   'page-hidden':
-    'The page was hidden during calibration. Return to the visible tab and retry.',
+    'The page was hidden during calibration. Return to the visible tab and click Calibrate again.',
   'resolution-changed':
     'The camera resolution changed during calibration. Calibration was discarded.',
-  'insufficient-samples':
-    'Not enough stable measurements were collected. Keep one face visible, close both eyes fully at the prompt, and retry.',
-  'insufficient-separation':
-    'Open and closed eye measurements overlapped or were too close to set a reliable threshold. Improve lighting or camera angle and retry.',
+  'insufficient-samples': CALIBRATION_UNSTABLE_MESSAGE,
+  'insufficient-separation': CALIBRATION_UNSTABLE_MESSAGE,
   cancelled: 'Calibration was cancelled.',
   'tracking-stopped':
-    'Tracking stopped during calibration. Start tracking and retry.',
+    'Tracking stopped during calibration. Start tracking and click Calibrate again.',
   'camera-changed': 'The camera changed, so calibration was discarded.',
+  'face-selection-changed':
+    'The selected face changed, so calibration was discarded. Click Calibrate for the new face.',
 };
 
-const OPEN_INSTRUCTION =
-  'Face the camera naturally at eye level and keep both eyes open.';
-const PREPARE_INSTRUCTION =
-  'Good. Keep your face still and get ready to close both eyes.';
-const CLOSED_INSTRUCTION =
-  'Now close both eyes completely and hold still until the progress bar fills.';
+const COMPLETE_INSTRUCTION = 'Calibration complete.';
 
 export function createInitialCalibrationState(): CalibrationState {
   return {
     step: 'idle',
     instruction: '',
     progress: 0,
-    openProgress: 0,
-    prepareProgress: 0,
-    closedProgress: 0,
     openSampleCount: 0,
-    closedSampleCount: 0,
-    rejectedClosedSamples: 0,
+    skippedBlinkSamples: 0,
+    rejectedFaceSamples: 0,
     failure: null,
     result: null,
   };
@@ -174,6 +155,14 @@ export function createInitialCalibrationState(): CalibrationState {
 
 function mean(values: readonly number[]): number {
   return values.reduce((sum, value) => sum + value, 0) / values.length;
+}
+
+function median(values: readonly number[]): number {
+  const sorted = [...values].sort((a, b) => a - b);
+  const middle = Math.floor(sorted.length / 2);
+  return sorted.length % 2 === 0
+    ? ((sorted[middle - 1] ?? 0) + (sorted[middle] ?? 0)) / 2
+    : (sorted[middle] ?? 0);
 }
 
 function percentile(values: readonly number[], fraction: number): number {
@@ -204,41 +193,38 @@ function sameResolution(
   return a !== null && a.width === b.width && a.height === b.height;
 }
 
-function eyeResult(
-  open: readonly number[],
-  closed: readonly number[],
-): CalibrationEyeResult | null {
-  if (open.length === 0 || closed.length === 0) return null;
-  const openSummary = summarize(open);
-  const closedSummary = summarize(closed);
-  const separation = openSummary.mean - closedSummary.mean;
+function eyeResult(values: readonly number[]): CalibrationEyeResult | null {
+  if (values.length < CALIBRATION_MIN_SAMPLES_PER_EYE) return null;
+  const openSummary = summarize(values);
+  const closedMean = Math.max(
+    CALIBRATION_MIN_EAR,
+    openSummary.p10 - CALIBRATION_CLOSURE_DROP_EAR,
+  );
+  const separation = openSummary.mean - closedMean;
   if (!Number.isFinite(separation) || separation < CALIBRATION_MIN_SEPARATION) {
     return null;
   }
-  const threshold = (openSummary.mean + closedSummary.mean) / 2;
-  // A sample-level filter rejects obvious transitions; this final check rejects
-  // sample sets whose ranges still straddle the derived threshold.
-  const margin = Math.min(CALIBRATION_MIN_SEPARATION, separation * 0.25);
-  if (
-    closedSummary.max > threshold - margin ||
-    openSummary.p10 < threshold + margin
-  ) {
-    return null;
-  }
+  const threshold = (openSummary.mean + closedMean) / 2;
   const hysteresis = Math.max(
     CALIBRATION_MIN_HYSTERESIS_EAR,
     separation * CALIBRATION_HYSTERESIS_FRACTION,
   );
   const reopenThreshold = Math.min(
     threshold + hysteresis,
-    openSummary.p10,
+    openSummary.mean - CALIBRATION_MIN_HYSTERESIS_EAR / 2,
   );
   if (!(reopenThreshold > threshold)) return null;
   return {
     openMean: openSummary.mean,
-    closedMean: closedSummary.mean,
+    closedMean,
     openSummary,
-    closedSummary,
+    closedSummary: {
+      count: 1,
+      mean: closedMean,
+      min: closedMean,
+      max: closedMean,
+      p10: closedMean,
+    },
     threshold,
     reopenThreshold,
     separation,
@@ -247,219 +233,145 @@ function eyeResult(
 
 export class CalibrationEngine {
   private state: CalibrationState = createInitialCalibrationState();
-  private step: 'idle' | 'open' | 'preparing' | 'closed' | 'cancelled' =
-    'idle';
-  private openSamples: CalibrationSample[] = [];
-  private closedSamples: CalibrationSample[] = [];
-  private rejectedClosedSamples = 0;
-  private stageStartedAt: number | null = null;
+  private collecting = false;
+  private startedAt: number | null = null;
   private lastSampleAt: number | null = null;
-  private stageResolution: CalibrationResolution | null = null;
-  private openSummary: {
-    left: CalibrationSampleSummary;
-    right: CalibrationSampleSummary;
-  } | null = null;
+  private unstableSince: number | null = null;
+  private resolution: CalibrationResolution | null = null;
+  private faceId: number | null = null;
+  private samples: CalibrationSample[] = [];
 
   getState(): CalibrationState {
-    return this.state;
+    return {...this.state};
   }
 
-  /** Starts a fresh two-stage calibration with a preparation interval. */
-  begin(atMs: number, resolution: CalibrationResolution): void {
+  /** Starts a fresh single-session eye baseline. */
+  begin(
+    atMs: number,
+    resolution: CalibrationResolution,
+    faceId: number | null = null,
+  ): void {
     this.reset();
-    this.step = 'open';
-    this.stageStartedAt = atMs;
+    this.collecting = true;
+    this.startedAt = atMs;
     this.lastSampleAt = atMs;
-    this.stageResolution = {...resolution};
-    this.publish(OPEN_INSTRUCTION, 0, 0, 0, 0);
+    this.resolution = {...resolution};
+    this.faceId = faceId;
+    this.publish(0);
   }
 
-  cancel(): void {
-    if (!this.isCollecting()) return;
-    this.reset();
-    this.step = 'cancelled';
+  /** Reuses a completed eye result while only the mouth baseline is retried. */
+  resume(
+    atMs: number,
+    resolution: CalibrationResolution,
+    faceId: number | null = null,
+  ): void {
+    if (!this.state.result) {
+      this.begin(atMs, resolution, faceId);
+      return;
+    }
+    this.collecting = false;
+    this.startedAt = null;
+    this.lastSampleAt = atMs;
+    this.unstableSince = null;
+    this.resolution = {...resolution};
+    this.faceId = faceId;
     this.state = {
-      ...createInitialCalibrationState(),
-      step: 'cancelled',
-      failure: {
-        reason: 'cancelled',
-        message: FAILURE_MESSAGES.cancelled,
-      },
+      ...this.state,
+      step: 'success',
+      instruction: COMPLETE_INSTRUCTION,
+      progress: 1,
+      failure: null,
     };
   }
 
-  /** Full restart after a failure; never reuses partial measurements. */
-  retry(atMs: number, resolution: CalibrationResolution): void {
-    this.begin(atMs, resolution);
+  cancel(): void {
+    if (!this.collecting) return;
+    this.reset();
+    this.state = {
+      ...createInitialCalibrationState(),
+      step: 'cancelled',
+      failure: {reason: 'cancelled', message: FAILURE_MESSAGES.cancelled},
+    };
+  }
+
+  retry(
+    atMs: number,
+    resolution: CalibrationResolution,
+    faceId: number | null = null,
+  ): void {
+    this.begin(atMs, resolution, faceId);
   }
 
   observe(sample: CalibrationSample, resolution: CalibrationResolution): void {
-    if (!this.isCollecting()) return;
+    if (!this.collecting || this.startedAt === null) return;
 
     if (
+      this.faceId !== null &&
+      sample.faceId != null &&
+      sample.faceId !== this.faceId
+    ) {
+      this.state = {
+        ...this.state,
+        rejectedFaceSamples: this.state.rejectedFaceSamples + 1,
+      };
+      return;
+    }
+    if (!sameResolution(this.resolution, resolution)) {
+      this.fail('resolution-changed');
+      return;
+    }
+    if (
+      !Number.isFinite(sample.atMs) ||
       !Number.isFinite(sample.leftEAR) ||
       !Number.isFinite(sample.rightEAR) ||
       sample.leftEAR < CALIBRATION_MIN_EAR ||
       sample.leftEAR > CALIBRATION_MAX_EAR ||
       sample.rightEAR < CALIBRATION_MIN_EAR ||
-      sample.rightEAR > CALIBRATION_MAX_EAR ||
-      !Number.isFinite(sample.atMs)
+      sample.rightEAR > CALIBRATION_MAX_EAR
     ) {
-      this.fail('invalid-sample');
+      this.pause(sample.atMs, 'invalid-sample');
       return;
     }
-
     if (
       this.lastSampleAt !== null &&
       sample.atMs - this.lastSampleAt > CALIBRATION_MAX_SAMPLE_GAP_MS
     ) {
-      this.fail('tracking-gap');
-      return;
-    }
-    if (!sameResolution(this.stageResolution, resolution)) {
-      this.fail('resolution-changed');
+      this.pause(sample.atMs, 'tracking-gap');
       return;
     }
 
     this.lastSampleAt = sample.atMs;
-
-    if (this.step === 'open') {
-      this.openSamples.push(sample);
-      const elapsed = sample.atMs - (this.stageStartedAt ?? sample.atMs);
-      this.publish(
-        OPEN_INSTRUCTION,
-        0.5 * this.progressFor(elapsed, CALIBRATION_OPEN_DURATION_MS),
-        this.progressFor(elapsed, CALIBRATION_OPEN_DURATION_MS),
-        0,
-        0,
-      );
-      if (elapsed >= CALIBRATION_OPEN_DURATION_MS) {
-        if (this.openSamples.length < CALIBRATION_MIN_OPEN_SAMPLES) {
-          this.fail('insufficient-samples');
-          return;
-        }
-        this.openSummary = {
-          left: summarize(this.openSamples.map((item) => item.leftEAR)),
-          right: summarize(this.openSamples.map((item) => item.rightEAR)),
-        };
-        this.step = 'preparing';
-        this.stageStartedAt = sample.atMs;
-        this.publish(PREPARE_INSTRUCTION, 0.5, 1, 0, 0);
-      }
-      return;
-    }
-
-    if (this.step === 'preparing') {
-      // No samples are collected while the user reacts to the close prompt.
-      const elapsed = sample.atMs - (this.stageStartedAt ?? sample.atMs);
-      const prepareProgress = this.progressFor(
-        elapsed,
-        CALIBRATION_PREPARE_DURATION_MS,
-      );
-      this.publish(
-        PREPARE_INSTRUCTION,
-        0.5 + 0.1 * prepareProgress,
-        1,
-        prepareProgress,
-        0,
-      );
-      if (elapsed >= CALIBRATION_PREPARE_DURATION_MS) {
-        this.step = 'closed';
-        this.stageStartedAt = sample.atMs;
-        this.closedSamples = [];
-        this.rejectedClosedSamples = 0;
-        this.publish(CLOSED_INSTRUCTION, 0.6, 1, 1, 0);
-      }
-      return;
-    }
-
-    const baseline = this.openSummary;
-    if (!baseline) {
-      this.fail('invalid-sample');
-      return;
-    }
-    // A closed-stage frame must be clearly below the low end of measured open
-    // values for both eyes; otherwise it is a reaction/transition frame.
-    const isClosed =
-      sample.leftEAR < baseline.left.p10 - CALIBRATION_MIN_SEPARATION &&
-      sample.rightEAR < baseline.right.p10 - CALIBRATION_MIN_SEPARATION;
-    if (isClosed) this.closedSamples.push(sample);
-    else this.rejectedClosedSamples += 1;
-
-    const elapsed = sample.atMs - (this.stageStartedAt ?? sample.atMs);
-    const closedProgress = this.progressFor(
-      elapsed,
-      CALIBRATION_CLOSED_DURATION_MS,
-    );
-    this.publish(
-      CLOSED_INSTRUCTION,
-      0.6 + 0.4 * closedProgress,
-      1,
-      1,
-      closedProgress,
-    );
-    if (elapsed < CALIBRATION_CLOSED_DURATION_MS) return;
-
-    if (this.closedSamples.length < CALIBRATION_MIN_CLOSED_SAMPLES) {
-      this.fail('insufficient-samples');
-      return;
-    }
-    const left = eyeResult(
-      this.openSamples.map((item) => item.leftEAR),
-      this.closedSamples.map((item) => item.leftEAR),
-    );
-    const right = eyeResult(
-      this.openSamples.map((item) => item.rightEAR),
-      this.closedSamples.map((item) => item.rightEAR),
-    );
-    if (!left || !right) {
-      this.fail('insufficient-separation');
-      return;
-    }
-
-    this.step = 'idle';
-    this.state = {
-      ...createInitialCalibrationState(),
-      step: 'success',
-      instruction:
-        'Calibration complete. Start monitoring to measure bilateral eye closure.',
-      progress: 1,
-      openProgress: 1,
-      prepareProgress: 1,
-      closedProgress: 1,
-      openSampleCount: this.openSamples.length,
-      closedSampleCount: this.closedSamples.length,
-      rejectedClosedSamples: this.rejectedClosedSamples,
-      result: {
-        left,
-        right,
-        capturedAtMs: sample.atMs,
-        resolution: {...resolution},
-      },
-    };
-  }
-
-  /** A tracking interruption invalidates an in-progress calibration. */
-  onInterruption(reason: CalibrationFailureReason): void {
-    if (this.isCollecting()) {
-      this.fail(reason);
-      return;
-    }
-    if (
-      this.state.result &&
-      (reason === 'camera-changed' || reason === 'resolution-changed')
-    ) {
+    this.unstableSince = null;
+    if (this.isBlink(sample)) {
       this.state = {
-        ...createInitialCalibrationState(),
-        step: 'failed',
-        failure: {reason, message: FAILURE_MESSAGES[reason]},
+        ...this.state,
+        skippedBlinkSamples: this.state.skippedBlinkSamples + 1,
       };
+      this.publish(this.progressAt(sample.atMs));
+      return;
     }
+
+    this.samples.push(sample);
+    this.publish(this.progressAt(sample.atMs));
+    this.finishIfReady(sample.atMs, resolution);
   }
 
-  /** External invalidation after the camera or its resolution changed. */
-  invalidate(reason: 'camera-changed' | 'resolution-changed'): void {
-    this.onInterruption(reason);
+  /**
+   * A brief tracking gap only pauses the session. Valid samples already
+   * collected from the same face remain in the window.
+   */
+  onInterruption(reason: CalibrationFailureReason, atMs?: number): void {
+    if (!this.collecting) return;
+    this.pause(atMs ?? this.lastSampleAt ?? this.startedAt ?? 0, reason);
+  }
+
+  invalidate(reason: 'camera-changed' | 'resolution-changed' | 'face-selection-changed'): void {
+    this.fail(reason);
+  }
+
+  invalidateForFaceChange(): void {
+    this.invalidate('face-selection-changed');
   }
 
   /** Records a precondition failure reported before the flow could begin. */
@@ -467,24 +379,101 @@ export class CalibrationEngine {
     this.fail(reason);
   }
 
-  private isCollecting(): boolean {
-    return this.step === 'open' || this.step === 'preparing' || this.step === 'closed';
+  private isBlink(sample: CalibrationSample): boolean {
+    if (this.samples.length < 5) return false;
+    const leftMedian = median(this.samples.map((item) => item.leftEAR));
+    const rightMedian = median(this.samples.map((item) => item.rightEAR));
+    return (
+      sample.leftEAR < leftMedian - CALIBRATION_MIN_SEPARATION ||
+      sample.rightEAR < rightMedian - CALIBRATION_MIN_SEPARATION
+    );
   }
 
-  private progressFor(elapsed: number, duration: number): number {
-    if (!Number.isFinite(elapsed) || elapsed <= 0) return 0;
-    return Math.min(1, elapsed / duration);
+  private progressAt(atMs: number): number {
+    if (this.startedAt === null) return 0;
+    const elapsed = Math.max(0, atMs - this.startedAt);
+    const timeProgress = Math.min(1, elapsed / CALIBRATION_DURATION_MS);
+    const sampleProgress = Math.min(
+      1,
+      this.samples.length / CALIBRATION_MIN_OPEN_SAMPLES,
+    );
+    return Math.min(1, timeProgress * 0.7 + sampleProgress * 0.3);
+  }
+
+  private finishIfReady(atMs: number, resolution: CalibrationResolution): void {
+    if (this.startedAt === null) return;
+    if (atMs - this.startedAt < CALIBRATION_DURATION_MS) return;
+    if (this.samples.length < CALIBRATION_MIN_OPEN_SAMPLES) {
+      this.fail('unstable-tracking');
+      return;
+    }
+
+    const filtered = this.samples.filter((sample) => {
+      const keep =
+        sample.leftEAR >= CALIBRATION_MIN_EAR + CALIBRATION_MIN_SEPARATION / 2 &&
+        sample.rightEAR >= CALIBRATION_MIN_EAR + CALIBRATION_MIN_SEPARATION / 2;
+      if (!keep) {
+        this.state = {
+          ...this.state,
+          skippedBlinkSamples: this.state.skippedBlinkSamples + 1,
+        };
+      }
+      return keep;
+    });
+    const left = eyeResult(filtered.map((sample) => sample.leftEAR));
+    const right = eyeResult(filtered.map((sample) => sample.rightEAR));
+    if (!left || !right) {
+      this.fail('unstable-tracking');
+      return;
+    }
+
+    this.collecting = false;
+    this.startedAt = null;
+    this.lastSampleAt = null;
+    this.unstableSince = null;
+    this.state = {
+      ...this.state,
+      step: 'success',
+      instruction: COMPLETE_INSTRUCTION,
+      progress: 1,
+      failure: null,
+      result: {
+        left,
+        right,
+        capturedAtMs: atMs,
+        resolution: {...resolution},
+        faceId: this.faceId,
+      },
+    };
+  }
+
+  private pause(atMs: number, reason: CalibrationFailureReason): void {
+    if (!this.collecting) return;
+    const eventMs = Number.isFinite(atMs)
+      ? atMs
+      : this.lastSampleAt ?? this.startedAt ?? 0;
+    if (this.unstableSince === null) this.unstableSince = eventMs;
+    if (eventMs - this.unstableSince >= CALIBRATION_UNSTABLE_TIMEOUT_MS) {
+      this.fail(
+        reason === 'invalid-sample' || reason === 'tracking-gap'
+          ? 'unstable-tracking'
+          : reason,
+      );
+      return;
+    }
+    // Advance the clock so the next valid frame after a short gap is sampled.
+    this.lastSampleAt = eventMs;
+    this.publish(this.progressAt(Math.max(0, this.lastSampleAt)));
   }
 
   private fail(reason: CalibrationFailureReason): void {
-    this.step = 'idle';
-    this.openSamples = [];
-    this.closedSamples = [];
-    this.rejectedClosedSamples = 0;
-    this.openSummary = null;
-    this.stageStartedAt = null;
+    this.collecting = false;
+    this.samples = [];
+    this.startedAt = null;
     this.lastSampleAt = null;
-    this.stageResolution = null;
+    this.unstableSince = null;
+    this.resolution = null;
+    this.faceId = null;
     this.state = {
       ...createInitialCalibrationState(),
       step: 'failed',
@@ -492,50 +481,34 @@ export class CalibrationEngine {
     };
   }
 
-  private publish(
-    instruction: string,
-    progress: number,
-    openProgress: number,
-    prepareProgress: number,
-    closedProgress: number,
-  ): void {
+  private publish(progress: number): void {
     this.state = {
       ...this.state,
-      step: this.step,
-      instruction,
+      step: this.collecting ? 'collecting' : this.state.step,
+      instruction: this.collecting ? CALIBRATION_INSTRUCTION : this.state.instruction,
       progress,
-      openProgress,
-      prepareProgress,
-      closedProgress,
-      openSampleCount: this.openSamples.length,
-      closedSampleCount: this.closedSamples.length,
-      rejectedClosedSamples: this.rejectedClosedSamples,
+      openSampleCount: this.samples.length,
       failure: null,
-      result: null,
+      result: this.collecting ? null : this.state.result,
     };
   }
 
   private reset(): void {
-    this.step = 'idle';
-    this.openSamples = [];
-    this.closedSamples = [];
-    this.rejectedClosedSamples = 0;
-    this.stageStartedAt = null;
+    this.collecting = false;
+    this.samples = [];
+    this.startedAt = null;
     this.lastSampleAt = null;
-    this.stageResolution = null;
-    this.openSummary = null;
+    this.unstableSince = null;
+    this.resolution = null;
+    this.faceId = null;
     this.state = createInitialCalibrationState();
   }
 }
 
 export function calibrationLabel(state: CalibrationState): string {
   switch (state.step) {
-    case 'open':
-      return 'Calibrating: eyes open';
-    case 'preparing':
-      return 'Calibrating: get ready';
-    case 'closed':
-      return 'Calibrating: close eyes';
+    case 'collecting':
+      return 'Calibrating';
     case 'success':
       return 'Calibrated';
     case 'failed':

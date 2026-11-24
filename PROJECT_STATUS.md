@@ -6,7 +6,7 @@ Last updated: 2026-11-22
 
 The project now supports a portable two-laptop demo. One USB firmware upload turns the ESP32 into a camera-free LED/buzzer device that speaks a versioned newline protocol over Web Serial. The deployed HTTPS web app can then use any laptop's external webcam, ask for explicit browser camera/serial permission, verify the device handshake, calibrate locally, and monitor—without Arduino IDE, firmware upload, a local server, or ESP32 Wi-Fi setup on the second laptop.
 
-The original Wi-Fi alert-controller mode remains as a fallback for local HTTP development. The external webcam remains the only monitoring camera source. Camera tracking, calibration, closure episodes, history, browser sound, EAR thresholds, freshness handling, rearming, and one alert per episode are unchanged.
+The original Wi-Fi alert-controller mode remains as a fallback for local HTTP development. The external webcam remains the only monitoring camera source. Camera tracking, closure episodes, history, browser sound, EAR thresholds, freshness handling, rearming, and one alert per episode are unchanged. Calibration is now one session-only flow that collects eye and relaxed-mouth baselines together.
 
 A leased escalation exists in the USB firmware and browser controller, but it is **disabled at runtime in this GitHub/Vercel release** because its five-second cadence has not been physically accepted. `USB_ESCALATION_RELEASE_ENABLED` is `false`, so no `ESCALATE` command is sent and only the original one-shot LED/buzzer alert runs. The ESP32 firmware is unchanged by this release gate.
 
@@ -199,8 +199,9 @@ This is the **only firmware that has ever needed re-flashing**; build `usb-seria
 - Web Serial is desktop Chrome/Edge only; other browsers show the unsupported message and can still use Wi-Fi mode where mixed content permits it.
 - Other cameras, networks, boards, and browsers have not been individually validated.
 - Real-browser camera switching, overlay alignment, calibration under target lighting, threshold stability, IndexedDB edge cases, and interruption edge cases still need focused manual verification.
-- The vibration motor remains disabled. Do not connect it directly to a GPIO.
-- Drowsiness classification and yawning detection remain out of scope and must not be implied by current labels.
+- Numbered face selection, reselect-after-loss behavior, one-click eye and relaxed-mouth calibration, normal blinking and talking not resetting calibration progress, face-change invalidation, brief-versus-sustained mouth opening, pop-up readability/dismissal, and eye/yawn sound non-overlap still need focused webcam verification.
+- The vibration motor remains disabled. Do not connect it directly to a GPIO. The new yawn alert is browser-only and never routes to ESP32 hardware.
+- Drowsiness classification, severity escalation, and confirmed-yawn classification remain out of scope and must not be implied by current labels.
 
 ## Exact commands
 

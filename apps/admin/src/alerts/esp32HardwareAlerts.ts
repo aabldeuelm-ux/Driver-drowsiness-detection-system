@@ -1,3 +1,5 @@
+import type {ClosureEvent} from './eventStore';
+
 export type HardwareAlertLabel = 'LED' | 'Buzzer';
 
 export interface HardwareAlertTargets {
@@ -43,6 +45,19 @@ const ABORTED_OUTCOME: HardwareAlertOutcome = {
   aborted: true,
   message: 'Hardware alert command canceled; no retry was queued.',
 };
+
+/**
+ * ESP32 routing stays eye-closure only. Possible-yawn and non-local-camera
+ * events are browser-only, including when both pop-ups are visible together.
+ */
+export function shouldRouteEventToHardware(
+  event: Pick<ClosureEvent, 'cameraSource' | 'type'>,
+): boolean {
+  return (
+    event.cameraSource === 'this-device' &&
+    event.type === 'prolonged-eye-closure'
+  );
+}
 
 /**
  * Derives the bounded test endpoints from an explicitly configured alert

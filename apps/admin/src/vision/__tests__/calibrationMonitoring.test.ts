@@ -71,6 +71,15 @@ function createFace(rightEAR: number, leftEAR: number): LandmarkLike[] {
 
   setEye([33, 160, 158, 133, 153, 144], 0.3, rightEAR);
   setEye([362, 387, 386, 263, 373, 374], 0.6, leftEAR);
+
+  // A relaxed mouth with a non-zero width keeps mouth-baseline samples valid.
+  const mouthWidth = 0.24;
+  const mouthY = 0.62;
+  const lipGap = 0.1 * mouthWidth * 2;
+  setRight(61, 0.5 - mouthWidth / 2, mouthY);
+  setRight(291, 0.5 + mouthWidth / 2, mouthY);
+  setRight(13, 0.5, mouthY - lipGap / 2);
+  setRight(14, 0.5, mouthY + lipGap / 2);
   return landmarks;
 }
 
@@ -150,21 +159,20 @@ async function startTracking(harness: Harness): Promise<void> {
 }
 
 async function completeCalibration(harness: Harness): Promise<void> {
+  harness.setEAR(0.24, 0.2);
   harness.controller.startCalibration();
-  expect(harness.controller.getState().calibration.step).toBe('open');
+  expect(harness.controller.getState().calibration.step).toBe('collecting');
+  expect(harness.controller.getState().guidedCalibration.instruction).toBe(
+    'Look at the camera and relax your mouth. You can blink normally.',
+  );
 
-  harness.setEAR(0.24, 0.2);
   for (let index = 0; index < 26; index += 1) harness.advance();
-  expect(harness.controller.getState().calibration.step).toBe('preparing');
 
-  // Preparation frames are not used as closed samples.
-  harness.setEAR(0.24, 0.2);
-  for (let index = 0; index < 7; index += 1) harness.advance();
-  expect(harness.controller.getState().calibration.step).toBe('closed');
-
-  harness.setEAR(0.12, 0.1);
-  for (let index = 0; index < 8; index += 1) harness.advance();
-  expect(harness.controller.getState().calibration.step).toBe('success');
+  const state = harness.controller.getState();
+  expect(state.calibration.step).toBe('success');
+  expect(state.mouthBaseline.step).toBe('success');
+  expect(state.guidedCalibration.step).toBe('success');
+  expect(state.guidedCalibration.instruction).toBe('Calibration complete.');
 }
 
 beforeEach(() => {
@@ -186,7 +194,7 @@ describe('guided calibration and closure monitoring integration', () => {
 
     const calibrated = harness.controller.getState();
     expect(calibrated.calibration.result?.left.threshold).toBeCloseTo(0.15, 5);
-    expect(calibrated.calibration.result?.right.threshold).toBeCloseTo(0.18, 5);
+    expect(calibrated.calibration.result?.right.threshold).toBeCloseTo(0.19, 5);
     expect(calibrated.calibrationLabel).toBe('Calibrated');
     expect(calibrated.calibrationTone).toBe('teal');
     expect(calibrated.monitoring.status).toBe('ready');
@@ -229,7 +237,7 @@ describe('guided calibration and closure monitoring integration', () => {
     harness.advance();
     harness.setFaceCount(2);
     harness.advance();
-    harness.controller.retryCalibration();
+    harness.controller.startCalibration();
     expect(harness.controller.getState().calibration.failure?.reason).toBe(
       'face-not-single',
     );
@@ -384,10 +392,10 @@ describe('guided calibration and closure monitoring integration', () => {
     );
 
     // Right EAR is above its close threshold but still inside the hysteresis band.
-    harness.setEAR(0.19, 0.1);
+    harness.setEAR(0.195, 0.1);
     harness.advance();
     let rightDiagnostic = harness.controller.getState().closureDiagnostics.right;
-    expect(rightDiagnostic.ear).toBeCloseTo(0.19, 5);
+    expect(rightDiagnostic.ear).toBeCloseTo(0.195, 5);
     expect(rightDiagnostic.classification).toBe('closed');
     expect(rightDiagnostic.withinHysteresis).toBe(true);
 

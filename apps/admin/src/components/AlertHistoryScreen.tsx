@@ -11,14 +11,16 @@ import {useAlerts} from '../alerts/AlertsContext';
 import {
   cameraSourceLabel,
   endReasonLabel,
+  eventTypeLabel,
   formatDuration,
   formatTimestamp,
   type CameraSourceLabel,
   type ClosureEndReason,
   type ClosureEvent,
+  type ClosureEventType,
 } from '../alerts/eventStore';
 
-type EventTypeFilter = 'all' | 'prolonged-eye-closure';
+type EventTypeFilter = 'all' | ClosureEventType;
 type SourceFilter = 'all' | CameraSourceLabel;
 type EndReasonFilter = 'all' | ClosureEndReason | 'ongoing';
 
@@ -68,7 +70,7 @@ function EventRow({event, sessionId}: {event: ClosureEvent; sessionId: string}) 
       <td className="px-4 py-3">
         <span className="inline-flex items-center gap-1.5 text-sm font-medium text-amber-200">
           <AlertTriangle className="h-3.5 w-3.5 text-amber-400" aria-hidden="true" />
-          Prolonged eye closure
+          {eventTypeLabel(event.type)}
         </span>
         <span className="mt-0.5 block font-mono text-[10px] text-slate-500">
           {event.id}
@@ -98,7 +100,7 @@ function EventCard({event, sessionId}: {event: ClosureEvent; sessionId: string})
       <div className="flex flex-wrap items-center justify-between gap-2">
         <span className="inline-flex items-center gap-1.5 text-sm font-medium text-amber-200">
           <AlertTriangle className="h-3.5 w-3.5 text-amber-400" aria-hidden="true" />
-          Prolonged eye closure
+          {eventTypeLabel(event.type)}
         </span>
         <span className="font-mono text-[11px] text-slate-400">
           {formatDuration(event.observedDurationMs)}
@@ -264,6 +266,7 @@ export function AlertHistoryScreen() {
               >
                 <option value="all">All event types</option>
                 <option value="prolonged-eye-closure">Prolonged eye closure</option>
+                <option value="possible-yawn">Possible yawn</option>
               </select>
             </div>
 
@@ -306,6 +309,7 @@ export function AlertHistoryScreen() {
                 <option value="eyes-opened">Eyes reopened</option>
                 <option value="monitoring-stopped">Monitoring stopped</option>
                 <option value="tracking-interrupted">Tracking interrupted</option>
+                <option value="mouth-closed">Mouth returned to relaxed</option>
                 <option value="ongoing">Ongoing / not ended</option>
               </select>
             </div>

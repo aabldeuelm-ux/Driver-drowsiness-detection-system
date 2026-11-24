@@ -1,7 +1,7 @@
 import {AlertCircle, Cable, CheckCircle2, Usb} from 'lucide-react';
 import {useAlerts} from '../alerts/AlertsContext';
 import {USB_ESCALATION_RELEASE_ENABLED} from '../alerts/usbEscalationController';
-import type {UsbSerialConnectionState} from '../alerts/usbSerialAlert';
+import type {UsbSerialConnectionState, UsbSerialStatus} from '../alerts/usbSerialAlert';
 import {StatusBadge} from './StatusBadge';
 
 interface HardwareAlertPanelProps {
@@ -29,11 +29,34 @@ const USB_STATE_TONE: Record<
   error: 'red',
 };
 
+function getUsbNextAction(supported: boolean, status: UsbSerialStatus): string | null {
+  if (!supported || status.state === 'connected') return null;
+
+  if (status.state === 'error') {
+    const detail = status.message?.toLowerCase() ?? '';
+    if (detail.includes('handshake') || detail.includes('unexpected')) {
+      return 'Confirm the ESP32 is running build usb-serial-alert-controller-2026-11-22-v3, then click Connect USB alert device again and select the same serial port.';
+    }
+    return 'Check the USB data cable, close other serial monitors, then click Connect USB alert device again and select the ESP32 serial port.';
+  }
+  if (status.state === 'unsupported') {
+    return 'Use desktop Chrome or Edge from an HTTPS address, then reload the page.';
+  }
+  if (status.state === 'disconnected') {
+    return 'Connect the ESP32 by USB data cable, then click Connect USB alert device and choose its serial port.';
+  }
+  if (status.state === 'connecting') {
+    return 'Approve the browser serial-port prompt for the ESP32 device.';
+  }
+  return 'Wait for the handshake to finish; keep the ESP32 connected and its serial port free.';
+}
+
 export function HardwareAlertPanel({idPrefix}: HardwareAlertPanelProps) {
   const alerts = useAlerts();
   const usb = alerts.usbSerialStatus;
   const isUsb = alerts.hardwareTransport === 'usb';
   const usbBusy = usb.state === 'connecting' || usb.state === 'verifying';
+  const usbNextAction = getUsbNextAction(alerts.usbSerialSupported, usb);
   const escalationSupported = usb.features.includes('escalation');
   const transportLabel = isUsb ? 'USB serial' : 'Wi-Fi';
 
@@ -82,6 +105,20 @@ export function HardwareAlertPanel({idPrefix}: HardwareAlertPanelProps) {
               tone={USB_STATE_TONE[usb.state]}
             />
           </div>
+          <div className="flex flex-wrap items-center justify-between gap-2 text-xs text-slate-400">
+            <span>Web Serial</span>
+            <StatusBadge
+              icon={
+                alerts.usbSerialSupported ? (
+                  <CheckCircle2 className="h-3.5 w-3.5" />
+                ) : (
+                  <AlertCircle className="h-3.5 w-3.5" />
+                )
+              }
+              label={alerts.usbSerialSupported ? 'Available' : 'Unavailable'}
+              tone={alerts.usbSerialSupported ? 'teal' : 'red'}
+            />
+          </div>
 
           {!alerts.usbSerialSupported ? (
             <p className="flex items-start gap-2 rounded-lg border border-red-500/30 bg-red-500/10 p-3 text-xs leading-relaxed text-red-200">
@@ -114,10 +151,18 @@ export function HardwareAlertPanel({idPrefix}: HardwareAlertPanelProps) {
                   </button>
                 )}
               </div>
-              <p className="text-xs leading-relaxed text-slate-400">
-                The browser asks which serial port to use. The app verifies the
-                device identity before it allows hardware alerts to be enabled.
-              </p>
+              <ol className="list-decimal space-y-1 pl-5 text-xs leading-relaxed text-slate-400">
+                <li>Use desktop Chrome or Edge from an HTTPS address.</li>
+                <li>
+                  Connect the ESP32 running build{' '}
+                  <code className="font-mono text-slate-300">...2026-11-22-v3</code> by
+                  USB data cable.
+                </li>
+                <li>
+                  Choose the serial port in the browser prompt; the app verifies
+                  the device identity before allowing hardware alerts.
+                </li>
+              </ol>
               {usb.message && (
                 <p
                   role="status"
@@ -136,6 +181,27 @@ export function HardwareAlertPanel({idPrefix}: HardwareAlertPanelProps) {
                   <span>{usb.message}</span>
                 </p>
               )}
+              {usbNextAction && (
+                <div
+                  className={`flex items-start gap-2 rounded-lg border p-3 text-xs leading-relaxed ${
+                    usb.state === 'error'
+                      ? 'border-red-500/30 bg-red-500/10 text-red-200'
+                      : 'border-amber-500/30 bg-amber-500/10 text-amber-200'
+                  }`}
+                >
+                  <AlertCircle className="mt-0.5 h-4 w-4 shrink-0" aria-hidden="true" />
+                  <div className="space-y-0.5">
+                    <p className="font-medium">What to do next</p>
+                    <p>{usbNextAction}</p>
+                  </div>
+                </div>
+              )}
+              {usb.state === 'connected' && (
+                <p className="text-xs leading-relaxed text-teal-200">
+                  Connected and verified. The HELLO handshake was acknowledged;
+                  hardware alerts stay off until you enable the session toggle.
+                </p>
+              )}
               {usb.state === 'connected' && (
                 <dl className="grid grid-cols-1 gap-1 rounded-lg border border-slate-800 bg-[#10192D] p-3 text-xs sm:grid-cols-2">
                   <div className="min-w-0">
@@ -143,9 +209,15 @@ export function HardwareAlertPanel({idPrefix}: HardwareAlertPanelProps) {
                     <dd className="truncate font-mono text-slate-200">{usb.device}</dd>
                   </div>
                   <div className="min-w-0">
-                    <dt className="text-slate-500">Build</dt>
+                    <dt className="text-slate-500">Firmware build</dt>
                     <dd className="truncate font-mono text-slate-200">
                       {usb.build || 'not reported'}
+                    </dd>
+                  </div>
+                  <div className="min-w-0 sm:col-span-2">
+                    <dt className="text-slate-500">Features</dt>
+                    <dd className="truncate font-mono text-slate-200">
+                      {usb.features.length > 0 ? usb.features.join(', ') : 'none reported'}
                     </dd>
                   </div>
                 </dl>
@@ -250,6 +322,28 @@ export function HardwareAlertPanel({idPrefix}: HardwareAlertPanelProps) {
           >
             {alerts.hardwareAlertStatus.message}
           </p>
+        )}
+        {alerts.manualHardwareTestStatus.message && (
+          <div className="space-y-1 rounded-lg border border-slate-800 bg-[#10192D] p-3">
+            <p className="text-xs font-medium text-slate-300">Latest manual test response</p>
+            <p
+              role="status"
+              aria-live="polite"
+              className={`text-xs leading-relaxed ${
+                alerts.manualHardwareTestStatus.tone === 'red'
+                  ? 'text-red-300'
+                  : 'text-amber-200'
+              }`}
+            >
+              {alerts.manualHardwareTestStatus.acknowledged
+                ? 'Device acknowledged the command.'
+                : alerts.manualHardwareTestStatus.message}
+            </p>
+            <p className="text-xs leading-relaxed text-slate-400">
+              This reports command submission only. Confirm the LED and buzzer
+              physically during the bench test.
+            </p>
+          </div>
         )}
       </div>
     </div>

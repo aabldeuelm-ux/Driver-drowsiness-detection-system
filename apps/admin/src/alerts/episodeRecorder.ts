@@ -3,6 +3,7 @@ import type {
   MonitoringStatus,
 } from '../vision/eyeClosureMonitor';
 import type {AudioManager} from './audioManager';
+import {popupMessageFor, type AlertPopup} from './alertPopup';
 import {
   createId,
   type CameraSourceLabel,
@@ -39,6 +40,8 @@ export interface EpisodeRecorderOptions {
   onError?: (message: string) => void;
   /** Called once per new episode, beside the browser audio alert. */
   onEpisodeStart?: (event: ClosureEvent) => void;
+  /** Visual-only popup; never routes to hardware. */
+  onPopup?: (popup: AlertPopup) => void;
 }
 
 interface ActiveEpisode {
@@ -65,6 +68,7 @@ export class EpisodeRecorder {
   private readonly onEventUpdate?: (id: string, update: EventUpdate) => void;
   private readonly onError?: (message: string) => void;
   private readonly onEpisodeStart?: (event: ClosureEvent) => void;
+  private readonly onPopup?: (popup: AlertPopup) => void;
 
   private previousProlonged = false;
   private previousSourceActive = false;
@@ -82,6 +86,7 @@ export class EpisodeRecorder {
     this.onEventUpdate = options.onEventUpdate;
     this.onError = options.onError;
     this.onEpisodeStart = options.onEpisodeStart;
+    this.onPopup = options.onPopup;
   }
 
   /** Ends an in-flight episode from a page-level interruption such as pagehide. */
@@ -156,7 +161,16 @@ export class EpisodeRecorder {
     this.onEvent?.(event);
 
     void this.store.createEvent(event).catch(() => this.onError?.(SAVE_ERROR));
+    // One sound and one popup per episode. `onEpisodeStart` is the eye-only
+    // hardware hook and remains separate from browser notification state.
     this.audio.playAlert();
+    this.onPopup?.({
+      id: `popup-${id}`,
+      type: 'prolonged-eye-closure',
+      message: popupMessageFor('prolonged-eye-closure'),
+      timestamp: event.timestamp,
+      durationMs: event.observedDurationMs,
+    });
     this.onEpisodeStart?.(event);
   }
 

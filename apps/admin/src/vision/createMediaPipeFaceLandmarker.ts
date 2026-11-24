@@ -25,9 +25,9 @@ export async function createMediaPipeFaceLandmarker(): Promise<FaceLandmarkerLik
       delegate,
     },
     runningMode: 'VIDEO',
-    // Two faces are allowed so a second face can be reported as a monitoring
-    // problem; only a single face is ever used for measurements.
-    numFaces: 2,
+    // Several faces are returned so the user can select one spatially; only
+    // the selected face is ever used for measurements and alerts.
+    numFaces: 4,
     minFaceDetectionConfidence: 0.5,
     minFacePresenceConfidence: 0.5,
     minTrackingConfidence: 0.5,

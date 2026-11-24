@@ -218,9 +218,11 @@ describe('FaceTrackingController', () => {
 
     currentResult = {faceLandmarks: [face, face]};
     scheduler.fire(scheduler.lastHandle, frame(3));
+    expect(controller.getState().facePresence).toBe('multiple');
     expect(controller.getState().faceLabel).toBe(
-      'Monitoring problem: multiple faces',
+      'More than one face is visible. Choose a face to enable detection.',
     );
+    expect(controller.getState().faceCandidates).toHaveLength(2);
     expect(controller.getState().measurements).toBeNull();
   });
 

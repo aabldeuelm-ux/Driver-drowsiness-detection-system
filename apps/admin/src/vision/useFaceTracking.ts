@@ -11,8 +11,7 @@ export interface FaceTrackingApi {
   stopTracking: () => void;
   retryTracking: () => Promise<void>;
   startCalibration: () => void;
-  cancelCalibration: () => void;
-  retryCalibration: () => void;
+  selectFace: (faceId: number) => void;
   startMonitoring: () => void;
   stopMonitoring: () => void;
   invalidateCalibration: (
@@ -65,12 +64,8 @@ export function useFaceTracking(): FaceTrackingApi {
     () => controller.startCalibration(),
     [controller],
   );
-  const cancelCalibration = useCallback(
-    () => controller.cancelCalibration(),
-    [controller],
-  );
-  const retryCalibration = useCallback(
-    () => controller.retryCalibration(),
+  const selectFace = useCallback(
+    (faceId: number) => controller.selectFace(faceId),
     [controller],
   );
   const startMonitoring = useCallback(
@@ -97,8 +92,7 @@ export function useFaceTracking(): FaceTrackingApi {
     stopTracking,
     retryTracking,
     startCalibration,
-    cancelCalibration,
-    retryCalibration,
+    selectFace,
     startMonitoring,
     stopMonitoring,
     invalidateCalibration,

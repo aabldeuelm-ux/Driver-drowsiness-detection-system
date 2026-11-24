@@ -3,6 +3,7 @@ import {
   hardwareAlertTargets,
   sendCoordinatedHardwareAlerts,
   sendHardwareAlerts,
+  shouldRouteEventToHardware,
   type HardwareAlertTargets,
   type HardwareAlertSession,
 } from '../esp32HardwareAlerts';
@@ -10,6 +11,32 @@ import {
 function response(ok: boolean, status: number): Pick<Response, 'ok' | 'status'> {
   return {ok, status};
 }
+
+describe('shouldRouteEventToHardware', () => {
+  it('routes only local prolonged eye-closure events', () => {
+    expect(
+      shouldRouteEventToHardware({
+        cameraSource: 'this-device',
+        type: 'prolonged-eye-closure',
+      }),
+    ).toBe(true);
+  });
+
+  it('never routes possible-yawn or remote-camera events to ESP32', () => {
+    expect(
+      shouldRouteEventToHardware({
+        cameraSource: 'this-device',
+        type: 'possible-yawn',
+      }),
+    ).toBe(false);
+    expect(
+      shouldRouteEventToHardware({
+        cameraSource: 'esp32-cam',
+        type: 'prolonged-eye-closure',
+      }),
+    ).toBe(false);
+  });
+});
 
 describe('hardwareAlertTargets', () => {
   it('derives both bounded endpoints from an explicit alert device URL', () => {

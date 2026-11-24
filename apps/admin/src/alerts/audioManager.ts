@@ -2,6 +2,7 @@ import type {StatusTone} from '../types/dashboard';
 import type {SoundSettings} from './eventStore';
 
 export type AudioStatus = 'off' | 'locked' | 'ready' | 'blocked' | 'unsupported';
+export type AlertSoundKind = 'eye-closure' | 'possible-yawn';
 
 export interface AudioSnapshot {
   status: AudioStatus;
@@ -174,8 +175,25 @@ export class AudioManager {
     return this.getState();
   }
 
-  /** Short two-tone pattern; repeated calls never layer sounds. */
+  /** Existing eye-closure pattern; repeated calls never layer sounds. */
   playAlert(): void {
+    this.playPattern([
+      {frequency: 880, offset: 0, duration: 0.12},
+      {frequency: 660, offset: 0.2, duration: 0.16},
+    ]);
+  }
+
+  /** Distinct, non-overlapping pattern for a possible-yawn alert. */
+  playYawnAlert(): void {
+    this.playPattern([
+      {frequency: 620, offset: 0, duration: 0.14},
+      {frequency: 920, offset: 0.2, duration: 0.18},
+    ]);
+  }
+
+  private playPattern(
+    pattern: readonly {frequency: number; offset: number; duration: number}[],
+  ): void {
     if (this.disposed || this.state.muted || !this.state.enabled) return;
     if (!this.context || this.context.state !== 'running') {
       this.state = {
@@ -187,14 +205,11 @@ export class AudioManager {
       return;
     }
 
+    // Single owner of active nodes: a new alert always stops the previous one.
     this.stopNodes();
     const context = this.context;
     const start = context.currentTime;
     const peak = Math.pow(this.state.volume / 100, 2) * 0.18;
-    const pattern = [
-      {frequency: 880, offset: 0, duration: 0.12},
-      {frequency: 660, offset: 0.2, duration: 0.16},
-    ];
 
     this.state = {...this.state, playing: true, status: 'ready', message: null};
     try {
@@ -228,11 +243,14 @@ export class AudioManager {
     this.emit();
   }
 
-  async testSound(): Promise<AudioSnapshot> {
+  async testSound(kind: AlertSoundKind = 'eye-closure'): Promise<AudioSnapshot> {
     if (this.disposed || this.state.muted) return this.getState();
     this.setPreferences({enabled: true});
     const state = await this.enable();
-    if (state.status === 'ready') this.playAlert();
+    if (state.status === 'ready') {
+      if (kind === 'possible-yawn') this.playYawnAlert();
+      else this.playAlert();
+    }
     return this.getState();
   }
 

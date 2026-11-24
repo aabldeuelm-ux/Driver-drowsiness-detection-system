@@ -1,6 +1,7 @@
 import {useEffect, useRef, useState} from 'react';
 import {EYE_OUTLINES, type LandmarkPoint} from '../vision/earGeometry';
 import type {VideoSize} from '../vision/faceTrackingController';
+import {mapNormalizedPoint, type PreviewSize} from './previewGeometry';
 
 interface EyeLandmarkOverlayProps {
   landmarks: readonly LandmarkPoint[] | null;
@@ -9,32 +10,7 @@ interface EyeLandmarkOverlayProps {
   visible: boolean;
 }
 
-interface CanvasSize {
-  width: number;
-  height: number;
-}
-
-function mapLandmark(
-  landmark: LandmarkPoint,
-  canvasSize: CanvasSize,
-  videoSize: VideoSize,
-  mirrored: boolean,
-): LandmarkPoint {
-  // The preview uses object-cover. Reproduce that crop before drawing.
-  const scale = Math.max(
-    canvasSize.width / videoSize.width,
-    canvasSize.height / videoSize.height,
-  );
-  const drawnWidth = videoSize.width * scale;
-  const drawnHeight = videoSize.height * scale;
-  const offsetX = (canvasSize.width - drawnWidth) / 2;
-  const offsetY = (canvasSize.height - drawnHeight) / 2;
-
-  const x = offsetX + landmark.x * drawnWidth;
-  const y = offsetY + landmark.y * drawnHeight;
-
-  return {x: mirrored ? canvasSize.width - x : x, y};
-}
+type CanvasSize = PreviewSize;
 
 /** Presentation-only canvas overlay; it never stores video frames. */
 export function EyeLandmarkOverlay({
@@ -84,7 +60,7 @@ export function EyeLandmarkOverlay({
       const points = outline
         .map((index) => landmarks[index])
         .filter((point): point is LandmarkPoint => Boolean(point))
-        .map((point) => mapLandmark(point, canvasSize, videoSize, mirrored));
+        .map((point) => mapNormalizedPoint(point, canvasSize, videoSize, mirrored));
 
       if (points.length < 2) continue;
 

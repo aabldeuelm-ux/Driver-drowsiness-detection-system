@@ -1,5 +1,6 @@
 import type {StatusTone} from '../types/dashboard';
 import {
+  CALIBRATION_INSTRUCTION,
   calibrationLabel as labelForCalibration,
   createInitialCalibrationState,
   CalibrationEngine,
@@ -10,6 +11,12 @@ import {
 import {createMediaPipeFaceLandmarker} from './createMediaPipeFaceLandmarker';
 import {calculateEyeEARs} from './earGeometry';
 import {
+  createFaceTrackState,
+  landmarksToFaceBox,
+  trackFaces,
+  type FaceBox,
+} from './faceTracker';
+import {
   CLOSURE_MAX_SAMPLE_GAP_MS,
   createInitialMonitoringState,
   DEFAULT_PROLONGED_CLOSURE_MS,
@@ -17,6 +24,18 @@ import {
   type MonitoringInterruption,
   type MonitoringState,
 } from './eyeClosureMonitor';
+import {
+  createInitialMouthBaselineState,
+  MouthBaselineEngine,
+  type MouthBaselineState,
+} from './mouthBaseline';
+import {calculateMouthOpening} from './mouthOpening';
+import {
+  createYawnConfig,
+  YawnMonitor,
+  type YawnMonitorConfig,
+  type YawnMonitorPhase,
+} from './yawnMonitor';
 
 export type TrackingPhase =
   | 'off'
@@ -123,6 +142,48 @@ export interface ClosureDiagnostics {
   right: ClosureEyeDiagnostic;
 }
 
+/** Geometric, per-frame face marker. No appearance or biometric data is kept. */
+export interface FaceCandidate {
+  id: number;
+  number: number;
+  box: FaceBox;
+  selected: boolean;
+  ambiguous: boolean;
+}
+
+export interface GuidedCalibrationState {
+  step: 'idle' | 'collecting' | 'success' | 'failed';
+  instruction: string;
+  /** 0..1 across the single combined sampling session. */
+  progress: number;
+  eyesReady: boolean;
+  mouthReady: boolean;
+  failure: string | null;
+}
+
+export type YawnStatus =
+  | 'not-calibrated'
+  | 'ready'
+  | 'watching'
+  | 'candidate'
+  | 'detected'
+  | 'paused';
+
+export interface YawnState {
+  status: YawnStatus;
+  label: string;
+  tone: StatusTone;
+  opening: number | null;
+  openThreshold: number | null;
+  closeThreshold: number | null;
+}
+
+export interface YawnAlert {
+  id: string;
+  startedAt: number;
+  durationMs: number;
+}
+
 export interface FaceTrackingState {
   phase: TrackingPhase;
   statusLabel: string;
@@ -135,6 +196,11 @@ export interface FaceTrackingState {
   staleReason: StaleReason | null;
   measurements: EyeMeasurements | null;
   landmarks: readonly LandmarkLike[] | null;
+  /** Visible faces in stable numeric ID order, for selection UI and markers. */
+  faceCandidates: FaceCandidate[];
+  selectedFaceId: number | null;
+  /** Set when the selected face is lost or its identity is ambiguous. */
+  selectionPrompt: string | null;
   videoSize: VideoSize | null;
   inferenceFps: number | null;
   fpsPhase: FpsPhase;
@@ -148,7 +214,11 @@ export interface FaceTrackingState {
   calibrationTone: StatusTone;
   monitoringLabel: string;
   calibration: CalibrationState;
+  mouthBaseline: MouthBaselineState;
+  guidedCalibration: GuidedCalibrationState;
   monitoring: MonitoringState;
+  yawn: YawnState;
+  yawnAlert: YawnAlert | null;
   closureDiagnostics: ClosureDiagnostics;
   prolongedClosureMs: number;
 }
@@ -193,6 +263,28 @@ function emptyClosureDiagnostics(): ClosureDiagnostics {
   return {left: emptyEyeDiagnostic(), right: emptyEyeDiagnostic()};
 }
 
+function idleGuidedCalibration(): GuidedCalibrationState {
+  return {
+    step: 'idle',
+    instruction: '',
+    progress: 0,
+    eyesReady: false,
+    mouthReady: false,
+    failure: null,
+  };
+}
+
+function idleYawnState(): YawnState {
+  return {
+    status: 'not-calibrated',
+    label: 'Possible yawn: not calibrated',
+    tone: 'neutral',
+    opening: null,
+    openThreshold: null,
+    closeThreshold: null,
+  };
+}
+
 const DEFAULT_STATE: FaceTrackingState = {
   phase: 'off',
   statusLabel: PHASE_LABELS.off,
@@ -204,6 +296,9 @@ const DEFAULT_STATE: FaceTrackingState = {
   staleReason: null,
   measurements: null,
   landmarks: null,
+  faceCandidates: [],
+  selectedFaceId: null,
+  selectionPrompt: null,
   videoSize: null,
   inferenceFps: null,
   fpsPhase: 'idle',
@@ -216,7 +311,11 @@ const DEFAULT_STATE: FaceTrackingState = {
   calibrationTone: 'neutral',
   monitoringLabel: 'Not calibrated',
   calibration: createInitialCalibrationState(),
+  mouthBaseline: createInitialMouthBaselineState(),
+  guidedCalibration: idleGuidedCalibration(),
   monitoring: createInitialMonitoringState(),
+  yawn: idleYawnState(),
+  yawnAlert: null,
   closureDiagnostics: emptyClosureDiagnostics(),
   prolongedClosureMs: DEFAULT_PROLONGED_CLOSURE_MS,
 };
@@ -369,18 +468,18 @@ function deriveLabels(state: FaceTrackingState): Pick<
       ? 'red'
       : state.calibration.step === 'success'
         ? 'teal'
-        : state.calibration.step === 'open' ||
-            state.calibration.step === 'preparing' ||
-            state.calibration.step === 'closed' ||
+        : state.calibration.step === 'collecting' ||
             state.calibration.step === 'cancelled'
           ? 'amber'
           : 'neutral';
   const monitoringLabel = state.monitoring.reasonLabel
     ? `${state.monitoring.label} — ${state.monitoring.reasonLabel}`
     : state.monitoring.label;
-  const faceLabel = state.staleReason
-    ? STALE_LABELS[state.staleReason]
-    : FACE_LABELS[state.facePresence];
+  const faceLabel =
+    state.selectionPrompt ??
+    (state.staleReason
+      ? STALE_LABELS[state.staleReason]
+      : FACE_LABELS[state.facePresence]);
 
   const monitoringVisible =
     state.monitoring.active || state.monitoring.status === 'unavailable';
@@ -396,11 +495,7 @@ function deriveLabels(state: FaceTrackingState): Pick<
       state.calibration.step === 'cancelled'
     ) {
       statusLabel = labelForCalibration(state.calibration);
-    } else if (
-      state.calibration.step === 'open' ||
-      state.calibration.step === 'preparing' ||
-      state.calibration.step === 'closed'
-    ) {
+    } else if (state.calibration.step === 'collecting') {
       statusLabel = calibrationLabel;
     } else if (state.calibration.step === 'success') {
       statusLabel = 'Ready';
@@ -412,7 +507,8 @@ function deriveLabels(state: FaceTrackingState): Pick<
 
   // Face badges use this tracking-only tone. Closure severity changes the
   // session status badge, never the "One face detected" badge.
-  const faceTone = toneFor(state.phase, state.facePresence);
+  let faceTone = toneFor(state.phase, state.facePresence);
+  if (state.selectionPrompt && !state.staleReason) faceTone = 'amber';
   let tone = faceTone;
   if (state.staleReason || state.calibration.step === 'failed') tone = 'red';
   if (state.calibration.step === 'cancelled') tone = 'amber';
@@ -430,6 +526,88 @@ function deriveLabels(state: FaceTrackingState): Pick<
     monitoringLabel,
     tone,
   };
+}
+
+/**
+ * Presents the eye and mouth baselines as one calibration session. The two
+ * engines keep their own threshold objects; this only derives shared UI state.
+ */
+function deriveGuidedCalibration(
+  calibration: CalibrationState,
+  mouth: MouthBaselineState,
+): GuidedCalibrationState {
+  const eyesReady = calibration.step === 'success' && calibration.result !== null;
+  const mouthReady =
+    mouth.step === 'success' && mouth.relaxedOpening !== null;
+  const failure =
+    calibration.failure?.message ?? mouth.failure?.message ?? null;
+
+  if (eyesReady && mouthReady) {
+    return {
+      step: 'success',
+      instruction: 'Calibration complete.',
+      progress: 1,
+      eyesReady,
+      mouthReady,
+      failure: null,
+    };
+  }
+  if (
+    calibration.step === 'failed' ||
+    mouth.step === 'failed' ||
+    calibration.step === 'cancelled'
+  ) {
+    return {
+      step: 'failed',
+      instruction: failure ?? 'Calibration was interrupted. Click Calibrate to try again.',
+      progress: (calibration.progress + mouth.progress) / 2,
+      eyesReady,
+      mouthReady,
+      failure,
+    };
+  }
+  if (
+    calibration.step === 'collecting' ||
+    mouth.step === 'collecting'
+  ) {
+    return {
+      step: 'collecting',
+      instruction: CALIBRATION_INSTRUCTION,
+      progress: (calibration.progress + mouth.progress) / 2,
+      eyesReady,
+      mouthReady,
+      failure: null,
+    };
+  }
+  return {
+    ...idleGuidedCalibration(),
+    eyesReady,
+    mouthReady,
+  };
+}
+
+function yawnLabel(
+  config: YawnMonitorConfig | null,
+  phase: YawnMonitorPhase,
+  active: boolean,
+): Pick<YawnState, 'status' | 'label' | 'tone'> {
+  if (!config) {
+    return {
+      status: 'not-calibrated',
+      label: 'Possible yawn: not calibrated',
+      tone: 'neutral',
+    };
+  }
+  if (!active) {
+    return {status: 'ready', label: 'Possible yawn: start monitoring', tone: 'neutral'};
+  }
+  if (phase === 'active') {
+    return {status: 'detected', label: 'Possible yawn detected', tone: 'amber'};
+  }
+  if (phase === 'candidate') {
+    return {status: 'candidate', label: 'Possible yawn: watching opening', tone: 'amber'};
+  }
+  return {status: 'watching', label: 'Possible yawn: watching', tone: 'teal'};
 }
 
 /**
@@ -528,7 +706,21 @@ export class FaceTrackingController {
   private consecutiveInferenceErrors = 0;
 
   private readonly calibrationEngine = new CalibrationEngine();
+  private readonly mouthBaselineEngine = new MouthBaselineEngine();
   private readonly closureMonitor = new EyeClosureMonitor();
+  private readonly yawnMonitor = new YawnMonitor(createYawnConfig(0.15));
+  private faceTrackState = createFaceTrackState();
+  private selectedFaceId: number | null = null;
+  private currentFaceId: number | null = null;
+  /** Spatial-only track ID whose samples may enter the current calibration. */
+  private calibrationFaceId: number | null = null;
+  private selectionPrompt: string | null = null;
+  /** Resumes a paused session only after a reselected face is reaffirmed. */
+  private pendingResumeAfterReaffirm = false;
+  private yawnConfig: YawnMonitorConfig | null = null;
+  private lastMouthOpening: number | null = null;
+  private yawnSeq = 0;
+  private monitoringRequested = false;
   private lastVideoSize: VideoSize | null = null;
   private appliedCalibrationResult: CalibrationResult | null = null;
 
@@ -644,7 +836,9 @@ export class FaceTrackingController {
     if (!this.canRun() || this.state.phase !== 'running') {
       return 'tracking-not-active';
     }
-    if (this.state.facePresence !== 'single') return 'face-not-single';
+    if (this.state.facePresence !== 'single' || this.state.selectionPrompt !== null) {
+      return 'face-not-single';
+    }
     if (this.state.staleReason !== null) return 'stale-results';
     const age = this.state.lastInferenceAgeMs;
     if (age === null || age > this.staleAfterMs) return 'stale-results';
@@ -659,28 +853,93 @@ export class FaceTrackingController {
     return null;
   }
 
+  /**
+   * One-click calibration. A completed baseline is reused when only the other
+   * baseline still needs samples; otherwise both engines start fresh.
+   */
   startCalibration(): void {
+    this.monitoringRequested = false;
+    this.pendingResumeAfterReaffirm = false;
     this.closureMonitor.stop();
+    this.clearYawnEpisode();
     const blocker = this.calibrationBlocker();
     if (blocker) {
       this.calibrationEngine.failFor(blocker);
       this.syncEngineStates();
       return;
     }
-    this.calibrationEngine.begin(this.now(), this.currentResolution());
+
+    const atMs = this.now();
+    const resolution = this.currentResolution();
+    const eyesReady = this.calibrationEngine.getState().result !== null;
+    const mouthReady =
+      this.mouthBaselineEngine.getState().relaxedOpening !== null;
+    this.calibrationFaceId = this.currentFaceId ?? this.selectedFaceId;
+
+    if (eyesReady && mouthReady) {
+      this.calibrationEngine.begin(atMs, resolution, this.calibrationFaceId);
+      this.mouthBaselineEngine.begin(atMs, this.calibrationFaceId);
+    } else {
+      this.calibrationEngine.resume(atMs, resolution, this.calibrationFaceId);
+      this.mouthBaselineEngine.resume(atMs, this.calibrationFaceId);
+    }
     this.syncEngineStates();
   }
 
-  cancelCalibration(): void {
-    this.calibrationEngine.cancel();
-    this.syncEngineStates();
+  /** Brief interruptions pause collection but keep valid face samples. */
+  private pauseCalibration(
+    atMs: number,
+    reason: CalibrationFailureReason = 'face-not-single',
+  ): void {
+    this.calibrationEngine.onInterruption(reason, atMs);
+    this.mouthBaselineEngine.onInterruption('tracking-gap', atMs);
   }
 
-  retryCalibration(): void {
-    this.startCalibration();
+  /**
+   * A different or ambiguous selected face invalidates both baselines. The
+   * user must start calibration again for the newly selected face.
+   */
+  private invalidateCalibrationForFaceChange(): void {
+    this.calibrationEngine.invalidateForFaceChange();
+    this.mouthBaselineEngine.invalidate('face-selection-changed');
+    this.calibrationFaceId = null;
+    this.closureMonitor.setCalibration(null);
+    this.appliedCalibrationResult = null;
+    this.monitoringRequested = false;
+    this.pendingResumeAfterReaffirm = false;
+    this.clearYawnEpisode();
+    this.yawnConfig = null;
+    this.yawnMonitor.setConfig(createYawnConfig(0.15));
+  }
+
+  /**
+   * Selects a face by its spatial track ID. No appearance, embedding, or other
+   * biometric identity is stored. Selecting a different person discards
+   * calibration; reaffirming the current person resumes a paused session.
+   */
+  selectFace(faceId: number): void {
+    const previous = this.selectedFaceId ?? this.currentFaceId;
+    const changed = previous !== null && previous !== faceId;
+    const reaffirmingPausedFace = this.selectionPrompt !== null;
+    this.selectedFaceId = faceId;
+    this.selectionPrompt = null;
+
+    if (changed) {
+      this.invalidateCalibrationForFaceChange();
+      this.closureMonitor.interrupt('face-not-visible');
+    } else {
+      // A paused session resumes only after the next frame confirms that the
+      // reselected face is uniquely visible.
+      this.pendingResumeAfterReaffirm =
+        this.monitoringRequested && reaffirmingPausedFace;
+      this.resumeMonitoringIfRequested();
+    }
+    this.syncEngineStates();
   }
 
   startMonitoring(): void {
+    this.monitoringRequested = true;
+    this.pendingResumeAfterReaffirm = false;
     this.applyCalibrationToMonitor();
     if (!this.calibrationEngine.getState().result) {
       this.syncEngineStates();
@@ -703,7 +962,10 @@ export class FaceTrackingController {
   }
 
   stopMonitoring(): void {
+    this.monitoringRequested = false;
+    this.pendingResumeAfterReaffirm = false;
     this.closureMonitor.stop();
+    this.clearYawnEpisode();
     this.syncEngineStates();
   }
 
@@ -718,7 +980,22 @@ export class FaceTrackingController {
     reason: 'camera-changed' | 'resolution-changed',
   ): void {
     this.calibrationEngine.invalidate(reason);
+    this.mouthBaselineEngine.invalidate(
+      reason === 'camera-changed' ? 'face-selection-changed' : 'unstable-mouth',
+    );
+    this.calibrationFaceId = null;
     this.closureMonitor.setCalibration(null);
+    this.appliedCalibrationResult = null;
+    this.clearYawnEpisode();
+    this.yawnConfig = null;
+    this.yawnMonitor.setConfig(createYawnConfig(0.15));
+    this.monitoringRequested = false;
+    this.pendingResumeAfterReaffirm = false;
+    if (reason === 'camera-changed') {
+      this.selectedFaceId = null;
+      this.currentFaceId = null;
+      this.faceTrackState = createFaceTrackState();
+    }
     this.syncEngineStates();
   }
 
@@ -736,13 +1013,100 @@ export class FaceTrackingController {
 
   private engineStates(): Pick<
     FaceTrackingState,
-    'calibration' | 'monitoring'
+    | 'calibration'
+    | 'mouthBaseline'
+    | 'guidedCalibration'
+    | 'monitoring'
+    | 'yawn'
+    | 'yawnAlert'
   > {
     this.applyCalibrationToMonitor();
+    const calibration = this.calibrationEngine.getState();
+    const mouthBaseline = this.mouthBaselineEngine.getState();
+    const monitoring = this.closureMonitor.getState();
     return {
-      calibration: this.calibrationEngine.getState(),
-      monitoring: this.closureMonitor.getState(),
+      calibration,
+      mouthBaseline,
+      guidedCalibration: deriveGuidedCalibration(calibration, mouthBaseline),
+      monitoring,
+      yawn: {
+        ...yawnLabel(this.yawnConfig, this.yawnMonitor.getSnapshot().phase, monitoring.active),
+        opening: this.lastMouthOpening,
+        openThreshold: this.yawnConfig?.openThreshold ?? null,
+        closeThreshold: this.yawnConfig?.closeThreshold ?? null,
+      },
+      yawnAlert: this.state.yawnAlert,
     };
+  }
+
+  private clearYawnEpisode(): void {
+    this.yawnMonitor.reset();
+  }
+
+  private clearYawnForLostFace(): void {
+    this.clearYawnEpisode();
+    this.lastMouthOpening = null;
+    this.yawnConfig = this.mouthBaselineEngine.getState().relaxedOpening === null
+      ? null
+      : this.yawnConfig;
+  }
+
+  private hasUsableMouthBaseline(): boolean {
+    return (
+      this.calibrationEngine.getState().result !== null &&
+      this.mouthBaselineEngine.getState().step === 'success' &&
+      this.mouthBaselineEngine.getState().relaxedOpening !== null
+    );
+  }
+
+  private configureYawnFromBaseline(): void {
+    if (!this.hasUsableMouthBaseline()) return;
+    const relaxed = this.mouthBaselineEngine.getState().relaxedOpening ?? 0.15;
+    const next = createYawnConfig(relaxed);
+    if (
+      this.yawnConfig?.openThreshold === next.openThreshold &&
+      this.yawnConfig?.closeThreshold === next.closeThreshold
+    ) {
+      return;
+    }
+    this.yawnConfig = next;
+    this.yawnMonitor.setConfig(next);
+  }
+
+  private resumeMonitoringIfRequested(
+    current?: Pick<
+      FaceTrackingState,
+      | 'facePresence'
+      | 'selectionPrompt'
+      | 'staleReason'
+      | 'lastInferenceAgeMs'
+      | 'measurements'
+    >,
+  ): void {
+    if (!this.monitoringRequested) return;
+    // Eye-closure monitoring is independent of yawning calibration; a failed
+    // mouth stage must not silently pause an existing eye session.
+    if (!this.calibrationEngine.getState().result) return;
+    const facePresence = current ? current.facePresence : this.state.facePresence;
+    const selectionPrompt = current
+      ? current.selectionPrompt
+      : this.state.selectionPrompt;
+    const staleReason = current ? current.staleReason : this.state.staleReason;
+    if (facePresence !== 'single' || selectionPrompt !== null || staleReason !== null) {
+      return;
+    }
+    const age = current?.lastInferenceAgeMs ?? this.state.lastInferenceAgeMs;
+    if (age === null || age > this.staleAfterMs) return;
+    const measurements = current?.measurements ?? this.state.measurements;
+    if (
+      !measurements ||
+      !isFiniteNumber(measurements.leftEAR) ||
+      !isFiniteNumber(measurements.rightEAR)
+    ) {
+      return;
+    }
+    this.closureMonitor.stop();
+    this.closureMonitor.start(this.now());
   }
 
   private syncEngineStates(): void {
@@ -756,14 +1120,19 @@ export class FaceTrackingController {
     this.clearFreshnessTimer();
     this.resetFrameData();
     this.lastVideoSize = null;
+    this.monitoringRequested = false;
+    this.pendingResumeAfterReaffirm = false;
     this.closureMonitor.stop();
-    const calibrationStep = this.calibrationEngine.getState().step;
-    if (
-      calibrationStep === 'open' ||
-      calibrationStep === 'preparing' ||
-      calibrationStep === 'closed'
-    ) {
+    this.clearYawnForLostFace();
+    this.selectedFaceId = null;
+    this.currentFaceId = null;
+    this.calibrationFaceId = null;
+    this.faceTrackState = createFaceTrackState();
+    if (this.calibrationEngine.getState().step === 'collecting') {
       this.calibrationEngine.failFor('tracking-stopped');
+    }
+    if (this.mouthBaselineEngine.getState().step === 'collecting') {
+      this.mouthBaselineEngine.invalidate('cancelled');
     }
 
     const phase: TrackingPhase = this.landmarker
@@ -800,8 +1169,11 @@ export class FaceTrackingController {
       this.cancelFrame();
       this.clearFreshnessTimer();
       this.resetFrameData();
+      this.pendingResumeAfterReaffirm = false;
       this.closureMonitor.interrupt('page-hidden');
-      this.calibrationEngine.onInterruption('page-hidden');
+      this.calibrationEngine.onInterruption('page-hidden', this.now());
+      this.mouthBaselineEngine.onInterruption('tracking-gap', this.now());
+      this.clearYawnForLostFace();
       this.patch({
         ...this.clearedMeasurements(),
         phase: 'paused',
@@ -859,7 +1231,9 @@ export class FaceTrackingController {
       inferenceAge > CLOSURE_MAX_SAMPLE_GAP_MS
     ) {
       this.closureMonitor.interrupt('inference-gap');
-      this.calibrationEngine.onInterruption('tracking-gap');
+      this.calibrationEngine.onInterruption('tracking-gap', now);
+      this.mouthBaselineEngine.onInterruption('tracking-gap', now);
+      this.clearYawnForLostFace();
     }
 
     this.patch({
@@ -890,7 +1264,9 @@ export class FaceTrackingController {
     this.video = null;
     this.lastVideoSize = null;
     this.calibrationEngine.cancel();
+    this.mouthBaselineEngine.reset();
     this.closureMonitor.setCalibration(null);
+    this.clearYawnForLostFace();
     this.appliedCalibrationResult = null;
     this.state = {...DEFAULT_STATE};
     this.emit();
@@ -1010,6 +1386,8 @@ export class FaceTrackingController {
     this.completedInferenceTimestamps = [];
     this.closureMonitor.interrupt('inference-gap');
     this.calibrationEngine.onInterruption('tracking-gap');
+    this.mouthBaselineEngine.interrupt('tracking-gap');
+    this.clearYawnForLostFace();
 
     if (mapped.code === 'unsupported') {
       this.closureMonitor.failStart('tracking-stopped');
@@ -1117,76 +1495,215 @@ export class FaceTrackingController {
     };
 
     const faces = result.faceLandmarks ?? [];
+    const aspectRatio = resolution.width > 0 && resolution.height > 0
+      ? resolution.width / resolution.height
+      : 1;
 
-    if (faces.length === 0) {
-      this.clearFrameMeasurements();
-      this.closureMonitor.interrupt('face-not-visible');
-      this.calibrationEngine.onInterruption('face-not-single');
-      const facePresence: FacePresence = 'none';
-      this.patch({
-        ...base,
-        ...this.engineStates(),
-        facePresence,
-        faceLabel: FACE_LABELS[facePresence],
-        tone: toneFor(base.phase, facePresence),
-      });
-      return;
+    // Assign MediaPipe result slots to stable spatial tracks. Result order is
+    // not treated as identity; only normalized position and size are used.
+    const detections: FaceBox[] = [];
+    const detectionLandmarks: (readonly LandmarkLike[])[] = [];
+    for (const face of faces) {
+      const box = landmarksToFaceBox(face);
+      if (!box) continue;
+      detections.push(box);
+      detectionLandmarks.push(face);
     }
+    const detectedFaceCount = detections.length;
+    const trackingFrame = trackFaces(this.faceTrackState, detections, completedAt, {
+      aspectRatio,
+    });
+    this.faceTrackState = trackingFrame.state;
 
-    if (faces.length > 1) {
-      this.clearFrameMeasurements();
-      this.closureMonitor.interrupt('multiple-faces');
-      this.calibrationEngine.onInterruption('face-not-single');
-      const facePresence: FacePresence = 'multiple';
-      this.patch({
-        ...base,
-        ...this.engineStates(),
-        facePresence,
-        faceLabel: FACE_LABELS[facePresence],
-        tone: 'red',
-      });
-      return;
-    }
+    const candidates: FaceCandidate[] = trackingFrame.visibleTracks.map((track, index) => ({
+      id: track.id,
+      number: index + 1,
+      box: track.box,
+      selected: this.selectedFaceId === track.id,
+      ambiguous: trackingFrame.ambiguousTrackIds.includes(track.id),
+    }));
 
-    const landmarks = faces[0] ?? [];
-    const ears = calculateEyeEARs(landmarks, resolution.width, resolution.height);
-    if (isFiniteNumber(ears.leftEAR) && isFiniteNumber(ears.rightEAR)) {
-      this.calibrationEngine.observe(
-        {leftEAR: ears.leftEAR, rightEAR: ears.rightEAR, atMs: completedAt},
-        resolution,
-      );
-      this.closureMonitor.observe({
-        leftEAR: ears.leftEAR,
-        rightEAR: ears.rightEAR,
-        atMs: completedAt,
-      });
+    const selectedAssignment =
+      this.selectedFaceId === null
+        ? null
+        : trackingFrame.assignments.find(
+            (assignment) => assignment.trackId === this.selectedFaceId,
+          ) ?? null;
+    const selectedVisible = trackingFrame.visibleTracks.some(
+      (track) => track.id === this.selectedFaceId,
+    );
+    const selectedAmbiguous =
+      selectedAssignment?.ambiguous === true ||
+      (this.selectedFaceId !== null &&
+        trackingFrame.ambiguousTrackIds.includes(this.selectedFaceId));
+    const autoSingle =
+      this.selectedFaceId === null && detectedFaceCount === 1;
+
+    let landmarks: readonly LandmarkLike[] | null = null;
+    let facePresence: FacePresence;
+    let prompt: string | null = null;
+
+    if (this.selectedFaceId !== null) {
+      if (!selectedVisible || !selectedAssignment) {
+        prompt =
+          detectedFaceCount === 0
+            ? 'Selected face is not visible. Choose a face when it returns.'
+            : 'Selected face was lost. Choose a face to resume detection.';
+        facePresence = detectedFaceCount === 0 ? 'none' : 'multiple';
+      } else if (selectedAmbiguous) {
+        prompt = 'Face identity is ambiguous. Choose the same face again.';
+        facePresence = 'multiple';
+      } else {
+        const index = selectedAssignment.detectionIndex;
+        landmarks = detectionLandmarks[index] ?? [];
+        facePresence = 'single';
+        // Keep the reselect prompt visible until the user explicitly reaffirms
+        // the face; a paused session must never resume silently.
+      }
+    } else if (detectedFaceCount === 0) {
+      facePresence = 'none';
+    } else if (detectedFaceCount > 1) {
+      facePresence = 'multiple';
+      prompt = 'More than one face is visible. Choose a face to enable detection.';
     } else {
-      this.closureMonitor.interrupt('inference-gap');
-      this.calibrationEngine.onInterruption('invalid-sample');
+      landmarks = detectionLandmarks[0] ?? [];
+      facePresence = 'single';
     }
 
-    const facePresence: FacePresence = 'single';
+    this.currentFaceId =
+      this.selectedFaceId ??
+      (autoSingle ? trackingFrame.visibleTracks[0]?.id ?? null : null);
+
+    const calibrationEngaged =
+      this.calibrationFaceId !== null &&
+      (this.calibrationEngine.getState().step === 'collecting' ||
+        this.mouthBaselineEngine.getState().step === 'collecting' ||
+        this.calibrationEngine.getState().result !== null ||
+        this.mouthBaselineEngine.getState().relaxedOpening !== null);
+    const faceIdentityChanged =
+      calibrationEngaged &&
+      (selectedAmbiguous ||
+        (detectedFaceCount > 1 && this.selectedFaceId === null) ||
+        (this.currentFaceId !== null &&
+          this.currentFaceId !== this.calibrationFaceId));
+    if (faceIdentityChanged) this.invalidateCalibrationForFaceChange();
+
+    const calibrationPaused =
+      this.selectionPrompt !== null ||
+      prompt !== null ||
+      faceIdentityChanged;
+    let ears: ReturnType<typeof calculateEyeEARs> | null = null;
+    if (facePresence === 'single' && landmarks !== null) {
+      ears = calculateEyeEARs(landmarks, resolution.width, resolution.height);
+      const opening = calculateMouthOpening(landmarks, aspectRatio);
+      this.lastMouthOpening = opening;
+
+      if (isFiniteNumber(ears.leftEAR) && isFiniteNumber(ears.rightEAR)) {
+        if (this.pendingResumeAfterReaffirm && prompt === null) {
+          const measurements = {
+            leftEAR: ears.leftEAR,
+            rightEAR: ears.rightEAR,
+            capturedAt: completedAt,
+          };
+          this.pendingResumeAfterReaffirm = false;
+          this.resumeMonitoringIfRequested({
+            facePresence,
+            selectionPrompt: null,
+            staleReason: null,
+            lastInferenceAgeMs: 0,
+            measurements,
+          });
+        }
+        if (calibrationPaused) {
+          this.pauseCalibration(completedAt);
+        } else {
+          this.calibrationEngine.observe(
+            {
+              leftEAR: ears.leftEAR,
+              rightEAR: ears.rightEAR,
+              atMs: completedAt,
+              faceId: this.currentFaceId,
+            },
+            resolution,
+          );
+          this.mouthBaselineEngine.observe({
+            atMs: completedAt,
+            opening,
+            faceId: this.currentFaceId,
+            valid: opening !== null,
+          });
+          if (this.mouthBaselineEngine.getState().step === 'success') {
+            this.configureYawnFromBaseline();
+          }
+        }
+        this.closureMonitor.observe({
+          leftEAR: ears.leftEAR,
+          rightEAR: ears.rightEAR,
+          atMs: completedAt,
+        });
+      } else {
+        this.closureMonitor.interrupt('inference-gap');
+        this.pauseCalibration(completedAt, 'invalid-sample');
+        this.clearYawnForLostFace();
+      }
+
+      if (
+        this.closureMonitor.getState().active &&
+        this.yawnConfig !== null &&
+        opening !== null
+      ) {
+        const event = this.yawnMonitor.handle({now: completedAt, opening});
+        if (event) {
+          this.yawnSeq += 1;
+          this.state = {
+            ...this.state,
+            yawnAlert: {
+              id: `yawn-${Math.round(event.startedAt)}-${this.yawnSeq}`,
+              startedAt: event.startedAt,
+              durationMs: event.durationMs,
+            },
+          };
+        }
+      } else {
+        this.yawnMonitor.reset();
+      }
+    } else {
+      this.selectionPrompt = prompt;
+      this.clearFrameMeasurements();
+      this.lastMouthOpening = null;
+      const reason: MonitoringInterruption =
+        facePresence === 'multiple' ? 'multiple-faces' : 'face-not-visible';
+      this.closureMonitor.interrupt(reason);
+      this.pauseCalibration(completedAt, 'face-not-single');
+      this.clearYawnForLostFace();
+    }
+
     this.patch({
       ...base,
       ...this.engineStates(),
       facePresence,
-      faceLabel: FACE_LABELS[facePresence],
-      tone: toneFor(base.phase, facePresence),
+      faceLabel: this.selectionPrompt ?? FACE_LABELS[facePresence],
+      tone: this.selectionPrompt ? 'amber' : toneFor(base.phase, facePresence),
+      faceCandidates: candidates,
+      selectedFaceId: this.selectedFaceId,
+      selectionPrompt: this.selectionPrompt,
       landmarks,
       videoSize: resolution,
-      measurements: {
-        leftEAR: ears.leftEAR,
-        rightEAR: ears.rightEAR,
-        capturedAt: completedAt,
-      },
+      measurements:
+        facePresence === 'single' && landmarks !== null && ears !== null
+          ? {leftEAR: ears.leftEAR, rightEAR: ears.rightEAR, capturedAt: completedAt}
+          : null,
     });
   }
 
   private markStale(reason: StaleReason, ageMs: number): void {
     this.clearFrameMeasurements();
     this.completedInferenceTimestamps = [];
+    this.pendingResumeAfterReaffirm = false;
     this.closureMonitor.interrupt('stale-frames');
-    this.calibrationEngine.onInterruption('stale-results');
+    this.calibrationEngine.onInterruption('stale-results', this.now());
+    this.mouthBaselineEngine.onInterruption('tracking-gap', this.now());
+    this.clearYawnForLostFace();
 
     this.patch({
       phase: 'error',
@@ -1247,6 +1764,9 @@ export class FaceTrackingController {
       staleReason: null,
       measurements: null,
       landmarks: null,
+      faceCandidates: [],
+      selectedFaceId: this.selectedFaceId,
+      selectionPrompt: this.selectionPrompt,
       videoSize: null,
       inferenceFps: null,
       fpsPhase: 'idle',
@@ -1263,6 +1783,7 @@ export class FaceTrackingController {
       ...this.state,
       measurements: null,
       landmarks: null,
+      faceCandidates: [],
       videoSize: null,
     };
   }

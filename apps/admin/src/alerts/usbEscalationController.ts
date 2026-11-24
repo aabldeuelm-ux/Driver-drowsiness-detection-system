@@ -54,7 +54,7 @@ export interface UsbEscalationOptions {
 }
 
 function isCalibrationActive(step: CalibrationStep): boolean {
-  return step === 'open' || step === 'preparing' || step === 'closed';
+  return step === 'collecting';
 }
 
 /**

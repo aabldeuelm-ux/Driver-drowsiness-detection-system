@@ -1,4 +1,5 @@
 import {beforeEach, describe, expect, it, vi} from 'vitest';
+import {EYE_CLOSURE_POPUP_MESSAGE, type AlertPopup} from '../alertPopup';
 import type {AudioManager} from '../audioManager';
 import {EpisodeRecorder, type EpisodeSnapshot} from '../episodeRecorder';
 import {
@@ -46,6 +47,7 @@ function createHarness(store: EventStore = new MemoryEventStore()) {
   } as unknown as AudioManager;
   const onError = vi.fn();
   const onEpisodeStart = vi.fn<(event: ClosureEvent) => void>();
+  const onPopup = vi.fn<(popup: AlertPopup) => void>();
   const recorder = new EpisodeRecorder({
     store,
     audio,
@@ -54,6 +56,7 @@ function createHarness(store: EventStore = new MemoryEventStore()) {
     createId: () => `event-${++idNumber}`,
     onError,
     onEpisodeStart,
+    onPopup,
   });
 
   return {
@@ -63,6 +66,7 @@ function createHarness(store: EventStore = new MemoryEventStore()) {
     stop,
     onError,
     onEpisodeStart,
+    onPopup,
     recorder,
     advance: (ms: number) => {
       nowMs += ms;
@@ -166,6 +170,30 @@ describe('EpisodeRecorder', () => {
     advance(800);
     recorder.handle(snapshot('prolonged-closure', {closureMs: 800}));
     expect(onEpisodeStart).toHaveBeenCalledTimes(2);
+  });
+
+  it('emits one dismissible eye pop-up per episode without replaying the sound', async () => {
+    const {recorder, onPopup, playAlert, advance} = harness;
+
+    recorder.handle(snapshot('eyes-open'));
+    advance(800);
+    recorder.handle(snapshot('prolonged-closure', {closureMs: 800}));
+    recorder.handle(snapshot('prolonged-closure', {closureMs: 900}));
+    recorder.handle(snapshot('eyes-open'));
+
+    expect(onPopup).toHaveBeenCalledTimes(1);
+    expect(onPopup).toHaveBeenCalledWith(
+      expect.objectContaining({
+        id: 'popup-event-1',
+        type: 'prolonged-eye-closure',
+        message: EYE_CLOSURE_POPUP_MESSAGE,
+        durationMs: 800,
+      }),
+    );
+    expect(playAlert).toHaveBeenCalledTimes(1);
+    expect(onPopup.mock.invocationCallOrder[0]).toBeGreaterThan(
+      playAlert.mock.invocationCallOrder[0]!,
+    );
   });
 
   it('updates the same event once when tracking interrupts, without counting gap time', async () => {

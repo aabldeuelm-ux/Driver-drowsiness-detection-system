@@ -11,8 +11,24 @@ import {
 import {useCamera} from '../camera/CameraContext';
 import {useTracking} from '../vision/TrackingContext';
 import {CLOSURE_MAX_SAMPLE_GAP_MS} from '../vision/eyeClosureMonitor';
-import {AudioManager, type AudioSnapshot} from './audioManager';
-import {hardwareAlertTargets, sendHardwareAlerts} from './esp32HardwareAlerts';
+import {DEFAULT_YAWN_MIN_DURATION_MS} from '../vision/yawnMonitor';
+import {
+  addAlertPopup,
+  dismissAlertPopup,
+  POPUP_VISIBLE_MS,
+  popupMessageFor,
+  type AlertPopup,
+} from './alertPopup';
+import {
+  AudioManager,
+  type AlertSoundKind,
+  type AudioSnapshot,
+} from './audioManager';
+import {
+  hardwareAlertTargets,
+  sendHardwareAlerts,
+  shouldRouteEventToHardware,
+} from './esp32HardwareAlerts';
 import {
   isWebSerialSupported,
   SerialAlertConnection,
@@ -50,6 +66,13 @@ export interface HardwareAlertStatus {
   at: number | null;
 }
 
+/** UI-only record of the last explicit manual test response. */
+export interface ManualHardwareTestStatus extends HardwareAlertStatus {
+  transport: HardwareAlertTransport | null;
+  /** True only when a USB TEST command received an ACK. */
+  acknowledged: boolean;
+}
+
 export interface AlertsApi {
   events: ClosureEvent[];
   sessionId: string;
@@ -60,6 +83,9 @@ export interface AlertsApi {
   settings: AppSettings;
   settingsHydrated: boolean;
   audio: AudioSnapshot;
+  /** Session-only dismissible notifications; both eye and yawn can coexist. */
+  alertPopups: AlertPopup[];
+  dismissAlertPopup: (id: string) => void;
   /** Session-only; never read from or written to persisted settings. */
   hardwareAlertsEnabled: boolean;
   setHardwareAlertsEnabled: (enabled: boolean) => void;
@@ -72,6 +98,8 @@ export interface AlertsApi {
   /** True only when the selected transport is configured and verified. */
   hardwareAlertReady: boolean;
   hardwareAlertStatus: HardwareAlertStatus;
+  /** Latest response from the explicit manual hardware test, not from episodes. */
+  manualHardwareTestStatus: ManualHardwareTestStatus;
   usbSerialSupported: boolean;
   usbSerialStatus: UsbSerialStatus;
   /** Browser-side state of the leased 5-second escalation pattern. */
@@ -82,7 +110,7 @@ export interface AlertsApi {
   testHardwareAlert: () => Promise<void>;
   setProlongedClosureMs: (value: number) => void;
   enableSound: () => Promise<AudioSnapshot>;
-  testSound: () => Promise<AudioSnapshot>;
+  testSound: (kind?: AlertSoundKind) => Promise<AudioSnapshot>;
   setMuted: (muted: boolean) => void;
   setVolume: (volume: number) => void;
   clearHistory: () => Promise<void>;
@@ -100,6 +128,14 @@ const IDLE_HARDWARE_ALERT_STATUS: HardwareAlertStatus = {
   tone: 'neutral',
   message: null,
   at: null,
+};
+
+const IDLE_MANUAL_HARDWARE_TEST_STATUS: ManualHardwareTestStatus = {
+  tone: 'neutral',
+  message: null,
+  at: null,
+  transport: null,
+  acknowledged: false,
 };
 
 /** Never keep pasted credentials in React state or visible UI labels. */
@@ -176,6 +212,10 @@ export function AlertsProvider({children}: {children: ReactNode}) {
     useState<UsbEscalationStatus>({active: false, message: null});
   const [hardwareAlertStatus, setHardwareAlertStatus] =
     useState<HardwareAlertStatus>(IDLE_HARDWARE_ALERT_STATUS);
+  const [manualHardwareTestStatus, setManualHardwareTestStatus] =
+    useState<ManualHardwareTestStatus>(IDLE_MANUAL_HARDWARE_TEST_STATUS);
+  const [alertPopups, setAlertPopups] = useState<AlertPopup[]>([]);
+  const popupTimersRef = useRef<Map<string, ReturnType<typeof setTimeout>>>(new Map());
 
   const usbSerialSupported = isWebSerialSupported();
   const usbConnected = usbSerialStatus.state === 'connected' && serial.isConnected();
@@ -205,6 +245,37 @@ export function AlertsProvider({children}: {children: ReactNode}) {
   const hardwareControllersRef = useRef<Set<AbortController>>(new Set());
   const hardwareEpochRef = useRef(0);
   const onEpisodeStartRef = useRef<(event: ClosureEvent) => void>(() => {});
+  const lastYawnAlertIdRef = useRef<string | null>(null);
+
+  const dismissPopup = useCallback((id: string) => {
+    const timer = popupTimersRef.current.get(id);
+    if (timer !== undefined) {
+      clearTimeout(timer);
+      popupTimersRef.current.delete(id);
+    }
+    setAlertPopups((current) => dismissAlertPopup(current, id));
+  }, []);
+
+  const showPopup = useCallback(
+    (popup: AlertPopup) => {
+      setAlertPopups((current) => addAlertPopup(current, popup));
+      const existing = popupTimersRef.current.get(popup.id);
+      if (existing !== undefined) clearTimeout(existing);
+      popupTimersRef.current.set(
+        popup.id,
+        setTimeout(() => dismissPopup(popup.id), POPUP_VISIBLE_MS),
+      );
+    },
+    [dismissPopup],
+  );
+
+  useEffect(
+    () => () => {
+      for (const timer of popupTimersRef.current.values()) clearTimeout(timer);
+      popupTimersRef.current.clear();
+    },
+    [],
+  );
 
   const sendEscalationCommand = useCallback(
     async (command: EscalationCommand) => {
@@ -258,6 +329,7 @@ export function AlertsProvider({children}: {children: ReactNode}) {
         ),
       onError: (message) => setStorageError(message),
       onEpisodeStart: (event) => onEpisodeStartRef.current(event),
+      onPopup: (popup) => showPopup(popup),
     });
   }
   const recorder = recorderRef.current;
@@ -295,6 +367,7 @@ export function AlertsProvider({children}: {children: ReactNode}) {
       if (transport === hardwareGateRef.current.transport) return;
       abortPendingHardwareAlerts();
       setHardwareAlertsEnabledState(false);
+      setManualHardwareTestStatus(IDLE_MANUAL_HARDWARE_TEST_STATUS);
       setHardwareTransportState(transport);
       setHardwareAlertStatus({
         tone: 'neutral',
@@ -319,6 +392,7 @@ export function AlertsProvider({children}: {children: ReactNode}) {
     }
     abortPendingHardwareAlerts();
     setHardwareAlertsEnabledState(false);
+    setManualHardwareTestStatus(IDLE_MANUAL_HARDWARE_TEST_STATUS);
     setHardwareTransportState('usb');
     try {
       await serial.connect();
@@ -341,6 +415,7 @@ export function AlertsProvider({children}: {children: ReactNode}) {
   const disconnectUsbSerial = useCallback(async () => {
     abortPendingHardwareAlerts();
     setHardwareAlertsEnabledState(false);
+    setManualHardwareTestStatus(IDLE_MANUAL_HARDWARE_TEST_STATUS);
     await serial.disconnect();
     setHardwareAlertStatus({
       tone: 'red',
@@ -357,6 +432,7 @@ export function AlertsProvider({children}: {children: ReactNode}) {
         hardwareGateRef.current.transport === 'wifi'
       ) {
         abortPendingHardwareAlerts();
+        setManualHardwareTestStatus(IDLE_MANUAL_HARDWARE_TEST_STATUS);
         setHardwareAlertStatus(IDLE_HARDWARE_ALERT_STATUS);
       }
       setHardwareAlertUrlState(sanitized);
@@ -369,7 +445,24 @@ export function AlertsProvider({children}: {children: ReactNode}) {
       requireToggle: boolean,
       requireCameraLive: boolean,
       reportSkip: boolean,
+      trackManualTest = false,
     ) => {
+      const reportManualTest = (
+        tone: ManualHardwareTestStatus['tone'],
+        message: string,
+        transport: HardwareAlertTransport | null = null,
+        acknowledged = false,
+      ) => {
+        if (!trackManualTest) return;
+        setManualHardwareTestStatus({
+          tone,
+          message,
+          at: Date.now(),
+          transport,
+          acknowledged,
+        });
+      };
+
       const gate = hardwareGateRef.current;
       if (
         (requireToggle && !gate.enabled) ||
@@ -377,12 +470,10 @@ export function AlertsProvider({children}: {children: ReactNode}) {
           (!gate.cameraLive || gate.selectedCamera !== 'this-device'))
       ) {
         if (reportSkip) {
-          setHardwareAlertStatus({
-            tone: 'red',
-            message:
-              'Hardware test skipped: monitoring must be live on "This device".',
-            at: Date.now(),
-          });
+          const message =
+            'Hardware test skipped: monitoring must be live on "This device".';
+          reportManualTest('red', message);
+          setHardwareAlertStatus({tone: 'red', message, at: Date.now()});
         }
         return;
       }
@@ -390,21 +481,17 @@ export function AlertsProvider({children}: {children: ReactNode}) {
       const transport = gate.transport;
       const targets = transport === 'wifi' ? hardwareAlertTargets(gate.alertUrl) : null;
       if (transport === 'wifi' && targets === null) {
-        setHardwareAlertStatus({
-          tone: 'red',
-          message:
-            'Hardware alert skipped: enter a valid absolute HTTP(S) alert device URL. Monitoring continues.',
-          at: Date.now(),
-        });
+        const message =
+          'Hardware alert skipped: enter a valid absolute HTTP(S) alert device URL. Monitoring continues.';
+        reportManualTest('red', message, transport);
+        setHardwareAlertStatus({tone: 'red', message, at: Date.now()});
         return;
       }
       if (transport === 'usb' && (!gate.usbConnected || !serial.isConnected())) {
-        setHardwareAlertStatus({
-          tone: 'red',
-          message:
-            'Hardware alert skipped: connect and verify the USB alert device. Monitoring continues.',
-          at: Date.now(),
-        });
+        const message =
+          'Hardware alert skipped: connect and verify the USB alert device. Monitoring continues.';
+        reportManualTest('red', message, transport);
+        setHardwareAlertStatus({tone: 'red', message, at: Date.now()});
         return;
       }
 
@@ -414,14 +501,12 @@ export function AlertsProvider({children}: {children: ReactNode}) {
 
       const controller = new AbortController();
       hardwareControllersRef.current.add(controller);
-      setHardwareAlertStatus({
-        tone: 'amber',
-        message:
-          transport === 'wifi'
-            ? 'Sending LED and buzzer commands to the configured ESP32 alert device; physical activation not confirmed.'
-            : 'Sending one LED and buzzer command over USB to the verified alert device; physical activation not confirmed.',
-        at: Date.now(),
-      });
+      const sendingMessage =
+        transport === 'wifi'
+          ? 'Sending LED and buzzer commands to the configured ESP32 alert device; physical activation not confirmed.'
+          : 'Sending one LED and buzzer command over USB to the verified alert device; physical activation not confirmed.';
+      reportManualTest('amber', sendingMessage, transport);
+      setHardwareAlertStatus({tone: 'amber', message: sendingMessage, at: Date.now()});
 
       const isCurrent = () => {
         const current = hardwareGateRef.current;
@@ -445,7 +530,18 @@ export function AlertsProvider({children}: {children: ReactNode}) {
           transport === 'wifi' && targets
             ? await sendHardwareAlerts(targets, {signal: controller.signal})
             : await serial.sendTest({signal: controller.signal});
-        if (outcome.aborted || !isCurrent()) return;
+        if (outcome.aborted) {
+          reportManualTest('red', outcome.message, transport);
+          return;
+        }
+        if (!isCurrent()) return;
+        const acknowledged = transport === 'usb' && outcome.ok;
+        reportManualTest(
+          outcome.ok ? 'amber' : 'red',
+          acknowledged ? 'Device acknowledged the command.' : outcome.message,
+          transport,
+          acknowledged,
+        );
         setHardwareAlertStatus({
           tone: outcome.ok ? 'amber' : 'red',
           message: outcome.message,
@@ -460,7 +556,8 @@ export function AlertsProvider({children}: {children: ReactNode}) {
 
   const sendHardwareAlertForEpisode = useCallback(
     async (event: ClosureEvent) => {
-      if (event.cameraSource !== 'this-device') return;
+      // Hardware alerts remain eye-closure only; possible yawn stays in browser.
+      if (!shouldRouteEventToHardware(event)) return;
       await submitHardwareAlert(true, true, false);
     },
     [submitHardwareAlert],
@@ -468,7 +565,7 @@ export function AlertsProvider({children}: {children: ReactNode}) {
   onEpisodeStartRef.current = sendHardwareAlertForEpisode;
 
   const testHardwareAlert = useCallback(async () => {
-    await submitHardwareAlert(false, false, true);
+    await submitHardwareAlert(false, false, true, true);
   }, [submitHardwareAlert]);
 
   useEffect(() => serial.subscribe(setUsbSerialStatus), [serial]);
@@ -480,6 +577,7 @@ export function AlertsProvider({children}: {children: ReactNode}) {
     if (!hardwareAlertsEnabled || hardwareAlertReady) return;
     abortPendingHardwareAlerts();
     setHardwareAlertsEnabledState(false);
+    setManualHardwareTestStatus(IDLE_MANUAL_HARDWARE_TEST_STATUS);
     setHardwareAlertStatus({
       tone: 'red',
       message:
@@ -595,6 +693,58 @@ export function AlertsProvider({children}: {children: ReactNode}) {
     trackingPhase,
   ]);
 
+  const yawnAlert = tracking.state.yawnAlert;
+
+  // Yawn alerts are browser-only. The controller emits one alert ID per sustained
+  // selected-face mouth episode, so this effect neither feeds hardware routing
+  // nor reuses the prolonged-closure episode recorder.
+  useEffect(() => {
+    if (!settingsHydrated || !yawnAlert) return;
+    if (lastYawnAlertIdRef.current === yawnAlert.id) return;
+    if (
+      !cameraLive ||
+      selectedCamera !== 'this-device' ||
+      trackingPhase !== 'running'
+    ) {
+      return;
+    }
+    lastYawnAlertIdRef.current = yawnAlert.id;
+    const timestamp = new Date(Math.round(yawnAlert.startedAt + Date.now() - performance.now())).toISOString();
+    const event: ClosureEvent = {
+      id: `yawn-event-${yawnAlert.id}`,
+      sessionId,
+      timestamp,
+      type: 'possible-yawn',
+      severity: 'warning',
+      cameraSource: 'this-device',
+      configuredDurationMs: DEFAULT_YAWN_MIN_DURATION_MS,
+      observedDurationMs: Math.max(0, Math.round(yawnAlert.durationMs)),
+      endedAt: timestamp,
+      endReason: 'mouth-closed',
+      schemaVersion: 1,
+    };
+    setEvents((current) => sortEvents([event, ...current]));
+    void store.createEvent(event).catch(() => setStorageError('The alert could not be saved in this browser.'));
+    audio.playYawnAlert();
+    showPopup({
+      id: `popup-${event.id}`,
+      type: 'possible-yawn',
+      message: popupMessageFor('possible-yawn'),
+      timestamp,
+      durationMs: yawnAlert.durationMs,
+    });
+  }, [
+    audio,
+    cameraLive,
+    selectedCamera,
+    sessionId,
+    settingsHydrated,
+    showPopup,
+    store,
+    trackingPhase,
+    yawnAlert,
+  ]);
+
   // Escalation is deliberately separate from EpisodeRecorder: it never writes
   // history, plays browser audio, or creates another episode. This release keeps
   // the controller compiled and tested but gates it off at runtime; no START,
@@ -658,13 +808,16 @@ export function AlertsProvider({children}: {children: ReactNode}) {
     return audio.enable();
   }, [audio]);
 
-  const testSound = useCallback(async () => {
-    setSettings((current) => ({
-      ...current,
-      sound: {...current.sound, enabled: true},
-    }));
-    return audio.testSound();
-  }, [audio]);
+  const testSound = useCallback(
+    async (kind: AlertSoundKind = 'eye-closure') => {
+      setSettings((current) => ({
+        ...current,
+        sound: {...current.sound, enabled: true},
+      }));
+      return audio.testSound(kind);
+    },
+    [audio],
+  );
 
   const setMuted = useCallback(
     (muted: boolean) => {
@@ -702,6 +855,10 @@ export function AlertsProvider({children}: {children: ReactNode}) {
     try {
       await store.clearAll();
       setEvents([]);
+      for (const timer of popupTimersRef.current.values()) clearTimeout(timer);
+      popupTimersRef.current.clear();
+      setAlertPopups([]);
+      lastYawnAlertIdRef.current = null;
       setSettings(DEFAULT_SETTINGS);
       setTrackingDuration(DEFAULT_SETTINGS.prolongedClosureMs);
       audio.setPreferences(DEFAULT_SETTINGS.sound);
@@ -749,6 +906,8 @@ export function AlertsProvider({children}: {children: ReactNode}) {
       settings,
       settingsHydrated,
       audio: audioState,
+      alertPopups,
+      dismissAlertPopup: dismissPopup,
       hardwareAlertsEnabled,
       setHardwareAlertsEnabled,
       hardwareTransport,
@@ -757,6 +916,7 @@ export function AlertsProvider({children}: {children: ReactNode}) {
       setHardwareAlertUrl,
       hardwareAlertReady,
       hardwareAlertStatus,
+      manualHardwareTestStatus,
       usbSerialSupported,
       usbSerialStatus,
       usbEscalationStatus,
@@ -774,12 +934,15 @@ export function AlertsProvider({children}: {children: ReactNode}) {
       exportCSV,
     }),
     [
+      alertPopups,
       audioState,
       clearAllData,
       clearHistory,
+      dismissPopup,
       enableSound,
       events,
       hardwareAlertStatus,
+      manualHardwareTestStatus,
       hardwareAlertsEnabled,
       hardwareTransport,
       setHardwareTransport,

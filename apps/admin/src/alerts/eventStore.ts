@@ -7,14 +7,17 @@ export type CameraSourceLabel = 'this-device' | 'esp32-cam' | 'unknown';
 export type ClosureEndReason =
   | 'eyes-opened'
   | 'monitoring-stopped'
-  | 'tracking-interrupted';
+  | 'tracking-interrupted'
+  | 'mouth-closed';
+
+export type ClosureEventType = 'prolonged-eye-closure' | 'possible-yawn';
 
 export interface ClosureEvent {
   id: string;
   sessionId: string;
   /** ISO timestamp of the start of the prolonged-closure episode. */
   timestamp: string;
-  type: 'prolonged-eye-closure';
+  type: ClosureEventType;
   severity: 'warning';
   cameraSource: CameraSourceLabel;
   configuredDurationMs: number;
@@ -238,10 +241,16 @@ export function cameraSourceLabel(source: CameraSourceLabel): string {
   return 'Unknown';
 }
 
+export function eventTypeLabel(type: ClosureEventType): string {
+  if (type === 'possible-yawn') return 'Possible yawn';
+  return 'Prolonged eye closure';
+}
+
 export function endReasonLabel(reason: ClosureEndReason | null): string {
   if (reason === 'eyes-opened') return 'Eyes reopened';
   if (reason === 'monitoring-stopped') return 'Monitoring stopped';
   if (reason === 'tracking-interrupted') return 'Tracking interrupted';
+  if (reason === 'mouth-closed') return 'Mouth returned to relaxed';
   return 'Ongoing';
 }
 

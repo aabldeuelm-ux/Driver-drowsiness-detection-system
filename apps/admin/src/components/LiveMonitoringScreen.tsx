@@ -22,10 +22,14 @@ import {useAlerts} from '../alerts/AlertsContext';
 import {audioStatusLabel, audioStatusTone} from '../alerts/audioManager';
 import {useCamera} from '../camera/CameraContext';
 import {useTracking} from '../vision/TrackingContext';
-import type {TrackingFrameSource} from '../vision/faceTrackingController';
+import type {
+  GuidedCalibrationState,
+  TrackingFrameSource,
+} from '../vision/faceTrackingController';
 import {CameraSourceSelector} from './CameraSourceSelector';
 import {DeviceCameraVideo} from './DeviceCameraVideo';
 import {EyeLandmarkOverlay} from './EyeLandmarkOverlay';
+import {FaceSelectionOverlay} from './FaceSelectionOverlay';
 import {HardwareAlertPanel} from './HardwareAlertPanel';
 import {StatusBadge} from './StatusBadge';
 
@@ -33,6 +37,22 @@ function formatEAR(value: number | null | undefined): string {
   return value !== null && value !== undefined && Number.isFinite(value)
     ? value.toFixed(3)
     : '—';
+}
+
+function formatRatio(value: number | null | undefined): string {
+  return value !== null && value !== undefined && Number.isFinite(value)
+    ? value.toFixed(3)
+    : '—';
+}
+
+function guidedStepLabel(step: GuidedCalibrationState['step']): string {
+  const labels: Record<GuidedCalibrationState['step'], string> = {
+    idle: 'Not started',
+    collecting: 'Collecting',
+    success: 'Calibration complete',
+    failed: 'Needs retry',
+  };
+  return labels[step];
 }
 
 function formatSampleSummary(
@@ -86,7 +106,12 @@ export function LiveMonitoringScreen() {
 
   const trackingPhase = tracking.state.phase;
   const calibration = tracking.state.calibration;
+  const mouthBaseline = tracking.state.mouthBaseline;
+  const guidedCalibration = tracking.state.guidedCalibration;
   const monitoring = tracking.state.monitoring;
+  const yawn = tracking.state.yawn;
+  const faceCandidates = tracking.state.faceCandidates;
+  const showFaceSelection = faceCandidates.length > 1 || tracking.state.selectedFaceId !== null;
   const closureDiagnostics = tracking.state.closureDiagnostics;
   const hasFreshResults =
     tracking.state.lastInferenceAgeMs !== null &&
@@ -94,13 +119,11 @@ export function LiveMonitoringScreen() {
   const canCalibrateNow =
     trackingPhase === 'running' &&
     tracking.state.facePresence === 'single' &&
+    tracking.state.selectionPrompt === null &&
     tracking.state.staleReason === null &&
     hasFreshResults;
-  const canStartCalibration = cameraLive && canCalibrateNow;
-  const canCancelCalibration =
-    calibration.step === 'open' ||
-    calibration.step === 'preparing' ||
-    calibration.step === 'closed';
+  const canStartCalibration =
+    cameraLive && canCalibrateNow && guidedCalibration.step !== 'collecting';
   const canStartMonitoring =
     cameraLive &&
     canCalibrateNow &&
@@ -155,9 +178,10 @@ export function LiveMonitoringScreen() {
               Live Camera Feed
             </h2>
             <p className="mt-0.5 text-xs text-slate-400 sm:text-sm">
-              Local face tracking, guided eye calibration, and experimental
-              bilateral closure measurement are available here. This is not a
-              diagnosis or a safety device.
+              Local face tracking, one-click eye and relaxed-mouth calibration,
+              experimental bilateral closure measurement, and possible-yawn
+              alerts are available here. This is not a diagnosis or a safety
+              device.
             </p>
           </div>
 
@@ -186,6 +210,14 @@ export function LiveMonitoringScreen() {
                 mirrored={mirrorPreview}
                 visible={drawLandmarks && trackingPhase === 'running'}
               />
+              {showFaceSelection && (
+                <FaceSelectionOverlay
+                  candidates={faceCandidates}
+                  videoSize={tracking.state.videoSize}
+                  mirrored={mirrorPreview}
+                  onSelect={tracking.selectFace}
+                />
+              )}
               <div className="absolute top-3 left-3 flex flex-wrap items-center gap-2">
                 <StatusBadge
                   icon={<Video className="h-3.5 w-3.5" />}
@@ -208,6 +240,11 @@ export function LiveMonitoringScreen() {
                 )}
               </div>
               <div className="absolute right-3 bottom-3 flex flex-wrap justify-end gap-2">
+                <StatusBadge
+                  icon={<Activity className="h-3.5 w-3.5" />}
+                  label={yawn.label}
+                  tone={yawn.tone}
+                />
                 <span className="inline-flex items-center rounded-md border border-slate-700/80 bg-slate-950/70 px-2.5 py-1 text-xs font-medium text-slate-300 backdrop-blur-sm">
                   Experimental EAR
                 </span>
@@ -306,6 +343,55 @@ export function LiveMonitoringScreen() {
             </p>
           </div>
 
+          {(showFaceSelection || tracking.state.selectionPrompt) && (
+            <section
+              aria-labelledby="face-selection-heading"
+              className="rounded-lg border border-slate-800 bg-[#0B1221] p-3.5"
+            >
+              <h3
+                id="face-selection-heading"
+                className="text-sm font-medium text-slate-200"
+              >
+                Person to monitor
+              </h3>
+              {tracking.state.selectionPrompt && (
+                <p
+                  role="status"
+                  className="mt-2 rounded-md border border-amber-500/30 bg-amber-500/10 p-2 text-xs leading-relaxed text-amber-200"
+                >
+                  {tracking.state.selectionPrompt}
+                </p>
+              )}
+              <p className="mt-1.5 text-xs leading-relaxed text-slate-400">
+                Choose a numbered face in the preview or below. Tracking uses
+                position across frames only; it never stores face identity.
+              </p>
+              <div className="mt-2 flex flex-wrap gap-2">
+                {faceCandidates.map((candidate) => (
+                  <button
+                    key={candidate.id}
+                    type="button"
+                    onClick={() => tracking.selectFace(candidate.id)}
+                    aria-pressed={tracking.state.selectedFaceId === candidate.id}
+                    className={`inline-flex min-h-[44px] items-center rounded-lg border px-3.5 py-2 text-sm font-medium transition-colors ${
+                      tracking.state.selectedFaceId === candidate.id
+                        ? 'border-teal-400/60 bg-teal-500/20 text-teal-100'
+                        : 'border-slate-700 bg-slate-900 text-slate-200 hover:bg-slate-800'
+                    }`}
+                  >
+                    Face {candidate.number}
+                    {candidate.ambiguous ? ' · ambiguous' : ''}
+                  </button>
+                ))}
+              </div>
+              {faceCandidates.length === 0 && tracking.state.selectionPrompt && (
+                <p className="mt-2 text-xs text-slate-400">
+                  No face is available to select right now.
+                </p>
+              )}
+            </section>
+          )}
+
           <HardwareAlertPanel idPrefix="live" />
 
           {/* Camera, face-tracking, and placeholder controls */}
@@ -372,31 +458,8 @@ export function LiveMonitoringScreen() {
                 className="inline-flex min-h-[44px] items-center justify-center gap-2 rounded-lg border border-teal-500/40 bg-teal-500/10 px-4 py-2.5 text-sm font-medium text-teal-200 transition-colors hover:bg-teal-500/20 disabled:cursor-not-allowed disabled:opacity-70"
               >
                 <Crosshair className="h-4 w-4 shrink-0" aria-hidden="true" />
-                <span>Start calibration</span>
+                <span>Calibrate</span>
               </button>
-
-              {canCancelCalibration && (
-                <button
-                  type="button"
-                  onClick={tracking.cancelCalibration}
-                  className="inline-flex min-h-[44px] items-center justify-center gap-2 rounded-lg border border-amber-500/40 bg-amber-500/10 px-4 py-2.5 text-sm font-medium text-amber-200 transition-colors hover:bg-amber-500/20"
-                >
-                  <Square className="h-4 w-4 shrink-0" aria-hidden="true" />
-                  <span>Cancel calibration</span>
-                </button>
-              )}
-
-              {(calibration.step === 'failed' ||
-                calibration.step === 'cancelled') && (
-                <button
-                  type="button"
-                  onClick={tracking.retryCalibration}
-                  className="inline-flex min-h-[44px] items-center justify-center gap-2 rounded-lg border border-amber-500/40 bg-amber-500/10 px-4 py-2.5 text-sm font-medium text-amber-200 transition-colors hover:bg-amber-500/20"
-                >
-                  <RefreshCw className="h-4 w-4 shrink-0" aria-hidden="true" />
-                  <span>Retry calibration</span>
-                </button>
-              )}
 
               <button
                 type="button"
@@ -439,6 +502,20 @@ export function LiveMonitoringScreen() {
                 <Volume2 className="h-4 w-4 shrink-0" aria-hidden="true" />
                 <span>Test sound</span>
               </button>
+
+              <button
+                type="button"
+                onClick={() => void alerts.testSound('possible-yawn')}
+                disabled={
+                  !alerts.settingsHydrated ||
+                  alerts.audio.muted ||
+                  alerts.audio.status === 'unsupported'
+                }
+                className="inline-flex min-h-[44px] items-center justify-center gap-2 rounded-lg border border-slate-800 bg-[#0B1221] px-4 py-2.5 text-sm font-medium text-slate-200 transition-colors hover:bg-slate-800/60 disabled:cursor-not-allowed disabled:opacity-70"
+              >
+                <Volume2 className="h-4 w-4 shrink-0" aria-hidden="true" />
+                <span>Test yawn sound</span>
+              </button>
             </div>
 
             <div className="flex flex-wrap gap-x-5 gap-y-2">
@@ -462,53 +539,58 @@ export function LiveMonitoringScreen() {
               </label>
             </div>
 
-            {(canCancelCalibration ||
-              calibration.step === 'failed' ||
-              calibration.step === 'cancelled' ||
-              calibration.result !== null) && (
+            {(guidedCalibration.step !== 'idle' || calibration.result !== null) && (
               <div className="rounded-lg border border-slate-800 bg-[#0B1221] p-3.5">
                 <div className="flex flex-wrap items-center justify-between gap-2">
                   <span className="text-sm font-medium text-slate-200">
-                    Guided eye calibration
+                    Calibration
                   </span>
                   <StatusBadge
                     icon={<Crosshair className="h-3.5 w-3.5" />}
-                    label={tracking.state.calibrationLabel}
-                    tone={tracking.state.calibrationTone}
+                    label={guidedStepLabel(guidedCalibration.step)}
+                    tone={
+                      guidedCalibration.step === 'success'
+                        ? 'teal'
+                        : guidedCalibration.step === 'idle'
+                          ? 'neutral'
+                          : 'amber'
+                    }
                   />
                 </div>
 
-                {(calibration.step === 'open' ||
-                  calibration.step === 'preparing' ||
-                  calibration.step === 'closed') && (
-                  <div className="mt-3">
-                    <p className="text-xs leading-relaxed text-slate-300">
-                      {calibration.instruction}
-                    </p>
+                {guidedCalibration.instruction && (
+                  <p className="mt-3 text-xs leading-relaxed text-slate-300">
+                    {guidedCalibration.instruction}
+                  </p>
+                )}
+
+                {(guidedCalibration.step === 'collecting' ||
+                  guidedCalibration.step === 'success') && (
+                  <div className="mt-2">
                     <div
-                      className="mt-2 h-1.5 w-full overflow-hidden rounded-full bg-slate-800"
+                      className="h-1.5 w-full overflow-hidden rounded-full bg-slate-800"
                       role="progressbar"
+                      aria-label="Calibration progress"
                       aria-valuemin={0}
                       aria-valuemax={100}
-                      aria-valuenow={Math.round(calibration.progress * 100)}
+                      aria-valuenow={Math.round(guidedCalibration.progress * 100)}
                     >
                       <div
                         className="h-full rounded-full bg-teal-500 transition-[width]"
-                        style={{width: `${Math.round(calibration.progress * 100)}%`}}
+                        style={{width: `${Math.round(guidedCalibration.progress * 100)}%`}}
                       />
                     </div>
                     <p className="mt-1.5 font-mono text-[11px] text-slate-400">
-                      Open {Math.round(calibration.openProgress * 100)}% · Get ready{' '}
-                      {Math.round(calibration.prepareProgress * 100)}% · Closed{' '}
-                      {Math.round(calibration.closedProgress * 100)}% · Rejected{' '}
-                      {calibration.rejectedClosedSamples}
+                      Eyes {guidedCalibration.eyesReady ? 'ready' : 'collecting'} ·
+                      Mouth {guidedCalibration.mouthReady ? 'ready' : 'collecting'} ·
+                      Samples {mouthBaseline.sampleCount}
                     </p>
                   </div>
                 )}
 
-                {calibration.failure && (
+                {guidedCalibration.failure && (
                   <p className="mt-2 text-xs leading-relaxed text-amber-300">
-                    {calibration.failure.message}
+                    {guidedCalibration.failure}
                   </p>
                 )}
 
@@ -518,12 +600,14 @@ export function LiveMonitoringScreen() {
                     Right {calibration.result.right.threshold.toFixed(3)} EAR ·
                     {calibration.result.resolution.width} ×{' '}
                     {calibration.result.resolution.height}
+                    {mouthBaseline.relaxedOpening !== null &&
+                      ` · relaxed mouth ${mouthBaseline.relaxedOpening.toFixed(3)}`}
                   </p>
                 )}
               </div>
             )}
 
-            {(canCancelCalibration || calibration.result !== null) && (
+            {calibration.result !== null && (
               <section
                 aria-labelledby="calibration-diagnostics-heading"
                 className="rounded-lg border border-slate-800 bg-[#0B1221] p-3.5"
@@ -543,8 +627,9 @@ export function LiveMonitoringScreen() {
                   </span>
                 </div>
                 <p className="mt-1 text-[11px] leading-relaxed text-slate-400">
-                  Close starts a closure; reopen ends it after confirmation. Both
-                  come from this session's samples, not fixed EAR values.
+                  Eye samples are collected together with the relaxed-mouth
+                  baseline. Blink-affected frames are skipped. The closure
+                  reference is derived from this session's open-eye samples.
                 </p>
 
                 <div className="mt-3 grid grid-cols-1 gap-2.5 sm:grid-cols-2">
@@ -553,18 +638,14 @@ export function LiveMonitoringScreen() {
                     const resultEye = calibration.result?.[eye];
                     const openSummary = resultEye?.openSummary
                       ? formatSampleSummary(resultEye.openSummary)
-                      : calibration.step === 'open'
+                      : calibration.step === 'collecting'
                         ? `n=${calibration.openSampleCount} · collecting…`
                         : calibration.openSampleCount > 0
                           ? `n=${calibration.openSampleCount} · baseline complete`
                           : 'No samples yet';
-                    const closedSummary = resultEye?.closedSummary
-                      ? formatSampleSummary(resultEye.closedSummary)
-                      : calibration.step === 'closed'
-                        ? `n=${calibration.closedSampleCount} · collecting…`
-                        : calibration.closedSampleCount > 0
-                          ? `n=${calibration.closedSampleCount} · rejected ${calibration.rejectedClosedSamples}`
-                          : 'No samples yet';
+                    const closureReference = resultEye
+                      ? formatEAR(resultEye.closedMean)
+                      : 'Derived after sampling';
                     const classificationClass =
                       diagnostic.classification === 'closed'
                         ? 'border-amber-500/40 bg-amber-500/10 text-amber-300'
@@ -595,12 +676,18 @@ export function LiveMonitoringScreen() {
                         </div>
                         <dl className="mt-1.5 space-y-1 text-[11px]">
                           <div className="flex flex-wrap justify-between gap-x-2">
-                            <dt className="text-slate-500">Open samples</dt>
+                            <dt className="text-slate-500">Open-eye samples</dt>
                             <dd className="font-mono text-slate-300">{openSummary}</dd>
                           </div>
                           <div className="flex flex-wrap justify-between gap-x-2">
-                            <dt className="text-slate-500">Closed samples</dt>
-                            <dd className="font-mono text-slate-300">{closedSummary}</dd>
+                            <dt className="text-slate-500">Closure reference</dt>
+                            <dd className="font-mono text-slate-300">{closureReference}</dd>
+                          </div>
+                          <div className="flex flex-wrap justify-between gap-x-2">
+                            <dt className="text-slate-500">Blinks skipped</dt>
+                            <dd className="font-mono text-slate-300">
+                              {calibration.skippedBlinkSamples}
+                            </dd>
                           </div>
                           <div className="flex flex-wrap justify-between gap-x-2">
                             <dt className="text-slate-500">Close / reopen</dt>
@@ -623,6 +710,52 @@ export function LiveMonitoringScreen() {
               </section>
             )}
 
+            {(monitoring.active || yawn.status !== 'not-calibrated') && (
+              <section
+                aria-labelledby="yawn-diagnostics-heading"
+                className="rounded-lg border border-slate-800 bg-[#0B1221] p-3.5"
+              >
+                <div className="flex flex-wrap items-center justify-between gap-2">
+                  <h3
+                    id="yawn-diagnostics-heading"
+                    className="text-sm font-medium text-slate-200"
+                  >
+                    Possible-Yawn Diagnostics
+                  </h3>
+                  <StatusBadge
+                    icon={<Activity className="h-3.5 w-3.5" />}
+                    label={yawn.label}
+                    tone={yawn.tone}
+                  />
+                </div>
+                <p className="mt-1 text-[11px] leading-relaxed text-slate-400">
+                  A sustained mouth opening above the calibrated high threshold
+                  creates one browser-only alert. This is not drowsiness
+                  classification or a confirmed medical yawn.
+                </p>
+                <dl className="mt-3 grid grid-cols-1 gap-2 sm:grid-cols-3">
+                  <div className="rounded-md border border-slate-800 bg-[#0A1120] p-2.5">
+                    <dt className="text-[11px] text-slate-500">Opening ratio</dt>
+                    <dd className="mt-0.5 font-mono text-sm text-slate-100">
+                      {formatRatio(yawn.opening)}
+                    </dd>
+                  </div>
+                  <div className="rounded-md border border-slate-800 bg-[#0A1120] p-2.5">
+                    <dt className="text-[11px] text-slate-500">Alert threshold</dt>
+                    <dd className="mt-0.5 font-mono text-sm text-slate-100">
+                      {formatRatio(yawn.openThreshold)}
+                    </dd>
+                  </div>
+                  <div className="rounded-md border border-slate-800 bg-[#0A1120] p-2.5">
+                    <dt className="text-[11px] text-slate-500">Rearm threshold</dt>
+                    <dd className="mt-0.5 font-mono text-sm text-slate-100">
+                      {formatRatio(yawn.closeThreshold)}
+                    </dd>
+                  </div>
+                </dl>
+              </section>
+            )}
+
             {tracking.state.error && (
               <div className="rounded-lg border border-amber-500/25 bg-amber-500/8 p-3 text-xs leading-relaxed text-amber-200/90">
                 {tracking.state.error.message}
@@ -630,11 +763,12 @@ export function LiveMonitoringScreen() {
             )}
 
             <p className="text-xs leading-relaxed text-slate-400">
-              Calibration stores numeric EAR thresholds in memory only and must be
-              repeated after a reload or camera change. Monitoring measures
-              continuous bilateral closure; a short sound can play when a new
-              prolonged episode begins, and metadata-only events are stored locally.
-              Visual monitoring continues even if audio or storage fails.
+              Calibration stores numeric eye thresholds and a relaxed-mouth
+              baseline in memory only; repeat it after a reload, camera change,
+              or face change. Monitoring measures continuous bilateral closure
+              and possible sustained mouth opening. Metadata-only events stay in
+              this browser. Visual monitoring continues if audio or storage
+              fails.
             </p>
           </div>
         </div>
@@ -727,6 +861,18 @@ export function LiveMonitoringScreen() {
             <li className="flex flex-wrap items-center justify-between gap-x-3 gap-y-2 py-3">
               <span className="flex items-center gap-2.5 text-sm font-medium text-slate-200">
                 <Activity className="h-4 w-4 shrink-0 text-slate-400" aria-hidden="true" />
+                <span>Possible yawn</span>
+              </span>
+              <StatusBadge
+                icon={<Activity className="h-3.5 w-3.5" />}
+                label={yawn.label}
+                tone={yawn.tone}
+              />
+            </li>
+
+            <li className="flex flex-wrap items-center justify-between gap-x-3 gap-y-2 py-3">
+              <span className="flex items-center gap-2.5 text-sm font-medium text-slate-200">
+                <Activity className="h-4 w-4 shrink-0 text-slate-400" aria-hidden="true" />
                 <span>Drowsiness classification</span>
               </span>
               <StatusBadge
@@ -774,8 +920,10 @@ export function LiveMonitoringScreen() {
           </div>
 
           <p className="mt-2 text-xs leading-relaxed text-slate-400">
-            One short alert per new prolonged-closure episode; blinks and tracking
-            problems stay visual-only. Audio needs an explicit click after reload.
+            One short sound per new prolonged-closure episode and a distinct
+            pattern per sustained possible-yawn episode. Eye and yawn sounds never
+            overlap; blinks and tracking problems stay visual-only. Audio needs an
+            explicit click after reload.
           </p>
 
           <div className="mt-3 grid grid-cols-1 gap-3 sm:grid-cols-2">

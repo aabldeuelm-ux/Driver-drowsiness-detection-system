@@ -111,6 +111,33 @@ describe('AudioManager', () => {
     expect(context.oscillators.at(-1)?.stopCalls.some((at) => at === undefined)).toBe(true);
   });
 
+  it('uses a distinct yawn pattern and stops an eye sound before playing it', async () => {
+    const {context, manager} = createHarness();
+    await manager.enable();
+
+    manager.playAlert();
+    const eyeOscillators = [...context.oscillators];
+    expect(eyeOscillators.map((oscillator) => oscillator.frequency.calls[0]?.value)).toEqual([
+      880, 660,
+    ]);
+
+    manager.playYawnAlert();
+    expect(context.oscillators).toHaveLength(4);
+    expect(eyeOscillators.every((oscillator) => oscillator.stopCalls.some((at) => at === undefined))).toBe(
+      true,
+    );
+    expect(context.oscillators.slice(2).map((oscillator) => oscillator.frequency.calls[0]?.value)).toEqual([
+      620, 920,
+    ]);
+
+    manager.playAlert();
+    const yawnOscillators = context.oscillators.slice(2, 4);
+    expect(yawnOscillators.every((oscillator) => oscillator.stopCalls.some((at) => at === undefined))).toBe(
+      true,
+    );
+    expect(manager.getState().playing).toBe(true);
+  });
+
   it('stops active sound when muted and suppresses later alerts', async () => {
     const {context, manager} = createHarness();
     await manager.enable();

@@ -179,7 +179,7 @@ describe('USB escalation controller', () => {
       snapshot.tracking.phase = 'paused';
     }],
     ['calibration starts', (snapshot: UsbEscalationSnapshot) => {
-      snapshot.tracking.calibrationStep = 'open';
+      snapshot.tracking.calibrationStep = 'collecting';
     }],
     ['camera changes', (snapshot: UsbEscalationSnapshot) => {
       snapshot.cameraKey = 'camera-b';

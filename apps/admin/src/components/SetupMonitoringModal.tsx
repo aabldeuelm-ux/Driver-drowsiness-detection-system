@@ -148,6 +148,17 @@ export function SetupMonitoringModal({
               </li>
               <li className="flex flex-wrap items-center justify-between gap-2 py-2.5">
                 <span className="flex items-center gap-2 text-sm text-slate-300">
+                  <Activity className="h-4 w-4 shrink-0 text-slate-400" aria-hidden="true" />
+                  <span>Possible yawn</span>
+                </span>
+                <StatusBadge
+                  icon={<Activity className="h-3.5 w-3.5" />}
+                  label={tracking.state.yawn.label}
+                  tone={tracking.state.yawn.tone}
+                />
+              </li>
+              <li className="flex flex-wrap items-center justify-between gap-2 py-2.5">
+                <span className="flex items-center gap-2 text-sm text-slate-300">
                   <CircleSlash className="h-4 w-4 shrink-0 text-slate-400" aria-hidden="true" />
                   <span>Drowsiness classification</span>
                 </span>
@@ -159,7 +170,7 @@ export function SetupMonitoringModal({
               <li className="flex flex-wrap items-center justify-between gap-2 py-2.5">
                 <span className="flex items-center gap-2 text-sm text-slate-300">
                   <Crosshair className="h-4 w-4 shrink-0 text-slate-400" aria-hidden="true" />
-                  <span>Baseline eye calibration</span>
+                  <span>One-click baseline calibration</span>
                 </span>
                 <StatusBadge
                   icon={<Crosshair className="h-3.5 w-3.5" />}
@@ -176,11 +187,12 @@ export function SetupMonitoringModal({
               aria-hidden="true"
             />
             <p>
-              Local USB/webcam monitoring, guided eye calibration, experimental
-              bilateral closure measurement, browser sound alerts, and local
-              event history are available. The ESP32 is configured separately
-              as an optional LED/buzzer alert device. Drowsiness classification
-              and yawning detection are not implemented.
+              Local webcam monitoring, one-click eye and relaxed-mouth
+              calibration, experimental bilateral closure measurement, possible-yawn alerts,
+              browser sound and pop-up alerts, and local event history are
+              available. The ESP32 is configured separately as an optional
+              LED/buzzer eye-closure alert device. Drowsiness classification and
+              severity escalation are not implemented.
             </p>
           </div>
         </div>

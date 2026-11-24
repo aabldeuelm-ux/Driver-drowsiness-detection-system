@@ -42,6 +42,7 @@ function calibration(overrides: Partial<CalibrationResult> = {}): CalibrationRes
   return {
     left: eye(),
     right: eye(),
+    faceId: null,
     capturedAtMs: 1000,
     resolution: RESOLUTION,
     ...overrides,
